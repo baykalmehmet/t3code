@@ -1643,6 +1643,7 @@ export default function ChatView(props: ChatViewProps) {
     null,
   );
   const [respondingRequestIds, setRespondingRequestIds] = useState<ApprovalRequestId[]>([]);
+  const approvalResponsesInFlight = useRef(new Set<ApprovalRequestId>());
   const userInputResponsesInFlight = useRef(new Set<string>());
   const [respondingUserInputRequestIds, setRespondingUserInputRequestIds] = useState<
     ApprovalRequestId[]
@@ -2662,6 +2663,16 @@ export default function ChatView(props: ChatViewProps) {
     () => derivePendingRequests(threadActivities),
     [threadActivities],
   );
+  useEffect(() => {
+    const pendingRequestIds = new Set(pendingApprovals.map((request) => request.requestId));
+    for (const requestId of approvalResponsesInFlight.current) {
+      if (!pendingRequestIds.has(requestId)) approvalResponsesInFlight.current.delete(requestId);
+    }
+    setRespondingRequestIds((existing) => {
+      const retained = existing.filter((requestId) => pendingRequestIds.has(requestId));
+      return retained.length === existing.length ? existing : retained;
+    });
+  }, [pendingApprovals]);
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const activePendingRequestKey = JSON.stringify([
     environmentId,
@@ -7381,7 +7392,9 @@ export default function ChatView(props: ChatViewProps) {
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       if (!activeThreadId) return;
+      if (approvalResponsesInFlight.current.has(requestId)) return;
 
+      approvalResponsesInFlight.current.add(requestId);
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
@@ -7393,14 +7406,17 @@ export default function ChatView(props: ChatViewProps) {
           decision,
         },
       });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to submit approval decision.",
-        );
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThreadId,
+            error instanceof Error ? error.message : "Failed to submit approval decision.",
+          );
+        }
+        approvalResponsesInFlight.current.delete(requestId);
+        setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       }
-      setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
     [activeThreadId, environmentId, respondToThreadApproval, setThreadError],

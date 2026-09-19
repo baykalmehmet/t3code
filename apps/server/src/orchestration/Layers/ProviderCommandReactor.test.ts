@@ -74,6 +74,8 @@ import { ServerActivation } from "../../serverActivation.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
 
+import * as OwwWorkflow from "../owwWorkflow.ts";
+
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -167,6 +169,7 @@ describe("ProviderCommandReactor", () => {
 
   async function createHarness(input?: {
     readonly baseDir?: string;
+    readonly projectWorkspaceRoot?: string;
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
@@ -505,7 +508,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-project-create"),
         projectId: asProjectId("project-1"),
         title: "Provider Project",
-        workspaceRoot: "/tmp/provider-project",
+        workspaceRoot: input?.projectWorkspaceRoot ?? "/tmp/provider-project",
         defaultModelSelection: modelSelection,
         createdAt: now,
       }),
@@ -841,6 +844,258 @@ describe("ProviderCommandReactor", () => {
       );
     }),
   );
+
+  it.each(["success", "failure", "read_only", "approval", "rejected"] as const)(
+    "OWW dispatch %s keeps implementation out of T3",
+    async (mode) => {
+      const runId = "12345678-1234-1234-1234-123456789abc";
+      const approvalWorkflow = {
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+        candidate_sha: mode === "rejected" ? null : "5201a8709a344dea8b00491bc2b6da461785761b",
+        current_task: "application-change",
+        current_task_status: "WAITING",
+        required_human_action: "candidate decision for the exact SHA",
+      };
+      const nativeCall = vi.fn<OwwWorkflow.WorkflowCall>().mockResolvedValue({
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+      });
+      if (mode === "failure") nativeCall.mockRejectedValue(new Error("API unavailable"));
+      if (mode === "approval" || mode === "rejected")
+        nativeCall.mockImplementation(async (name, args) => {
+          expect(args.run_id).toBe(approvalWorkflow.run_id);
+          if (name === "get_run_details") return approvalWorkflow;
+          if (mode === "approval" && name === "approve_candidate")
+            return {
+              ...approvalWorkflow,
+              current_task_status: "RUNNING",
+              required_human_action: null,
+            };
+          throw new Error(`unexpected operation: ${name}`);
+        });
+      let submitted!: () => void;
+      const submissionStarted = new Promise<void>((resolve) => {
+        submitted = resolve;
+      });
+      const originalSubmit = OwwWorkflow.submitOwwRequest;
+      const submit = vi.spyOn(OwwWorkflow, "submitOwwRequest").mockImplementation((request) => {
+        submitted();
+        return originalSubmit(request, nativeCall);
+      });
+      const monitor = vi.spyOn(OwwWorkflow, "monitorOwwWorkflow").mockResolvedValue(undefined);
+      try {
+        const harness = await createHarness({
+          projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+        });
+        const now = "2026-01-01T00:00:00.000Z";
+        await harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make("oww-task"),
+            threadId: ThreadId.make("thread-1"),
+            message: {
+              messageId: asMessageId("oww-message"),
+              role: "user",
+              text:
+                mode === "read_only"
+                  ? "Explain this code"
+                  : mode === "approval" || mode === "rejected"
+                    ? `Approve candidate ${runId} for 5201a8709a344dea8b00491bc2b6da461785761b`
+                    : "Add Calendar Connection Status",
+              attachments: [],
+            },
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6-astra" },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        );
+        await submissionStarted;
+        await harness.drain();
+        if (mode === "read_only") {
+          expect(harness.sendTurn).toHaveBeenCalled();
+          expect(nativeCall).not.toHaveBeenCalled();
+        } else {
+          expect(harness.startSession).not.toHaveBeenCalled();
+          expect(harness.sendTurn).not.toHaveBeenCalled();
+          expect(harness.createWorktree).not.toHaveBeenCalled();
+          expect(harness.renameBranch).not.toHaveBeenCalled();
+          expect(harness.generateBranchName).not.toHaveBeenCalled();
+          const model = await harness.readModel();
+          const messages = model.threads[0]!.messages.map((message) => message.text).join("\n");
+          expect(messages).toContain(
+            mode === "success"
+              ? runId
+              : mode === "approval" || mode === "rejected"
+                ? runId
+                : "Workflow creation failed",
+          );
+          expect(await harness.readPendingTurnStarts()).toEqual([]);
+          if (mode === "approval" || mode === "rejected") {
+            expect(nativeCall.mock.calls.map(([name]) => name)).toEqual([
+              "get_run_details",
+              ...(mode === "approval" ? ["approve_candidate"] : []),
+            ]);
+            expect(nativeCall).not.toHaveBeenCalledWith("start_task", expect.anything());
+            if (mode === "approval")
+              expect(monitor).toHaveBeenCalledWith(
+                runId,
+                expect.any(Function),
+                undefined,
+                expect.any(Function),
+              );
+            else expect(monitor).not.toHaveBeenCalled();
+            if (mode === "rejected") {
+              expect(messages).toContain(
+                "Candidate decision rejected: Hatchet has no exact candidate SHA",
+              );
+            }
+          } else if (mode === "success")
+            expect(Object.keys(nativeCall.mock.calls[0]![1]).sort()).toEqual([
+              "execution_profile",
+              "project_id",
+              "request_id",
+              "t3_conversation_id",
+              "task",
+              "work_kind",
+            ]);
+          if (mode === "failure") expect(monitor).not.toHaveBeenCalled();
+        }
+      } finally {
+        submit.mockRestore();
+        monitor.mockRestore();
+      }
+    },
+  );
+
+  it("coalesces duplicate OWW approval commands after the first decision is resolved", async () => {
+    const runId = "12345678-1234-1234-1234-123456789abc";
+    const candidateSha = "5201a8709a344dea8b00491bc2b6da461785761b";
+    const requestId = asApprovalRequestId(`hatchet:${runId}:candidate:${candidateSha}`);
+    const resolveApproval = vi.spyOn(OwwWorkflow, "resolveOwwApprovalAction").mockResolvedValue({
+      handled: true,
+      action: "candidate",
+      decision: "accept",
+      resume: false,
+      workflow: {
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+        candidate_sha: candidateSha,
+        current_task: "pull-request",
+        current_task_status: "RUNNING",
+        required_human_action: null,
+      },
+    });
+    try {
+      const harness = await createHarness({
+        projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+      });
+      const dispatchApproval = (commandId: string) =>
+        harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.approval.respond",
+            commandId: CommandId.make(commandId),
+            threadId: ThreadId.make("thread-1"),
+            requestId,
+            decision: "accept",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+        );
+
+      await dispatchApproval("oww-candidate-approval-first");
+      await waitFor(() => resolveApproval.mock.calls.length === 1);
+      await harness.drain();
+      await dispatchApproval("oww-candidate-approval-duplicate");
+      await harness.drain();
+
+      expect(resolveApproval).toHaveBeenCalledTimes(1);
+      const model = await harness.readModel();
+      const thread = model.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      const requestActivities = thread?.activities.filter(
+        (activity) =>
+          typeof activity.payload === "object" &&
+          activity.payload !== null &&
+          (activity.payload as Record<string, unknown>).requestId === requestId,
+      );
+      expect(
+        requestActivities?.filter((activity) => activity.kind === "approval.resolved"),
+      ).toHaveLength(1);
+      expect(
+        requestActivities?.filter(
+          (activity) => activity.kind === "provider.approval.respond.failed",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      resolveApproval.mockRestore();
+    }
+  });
+
+  it("keeps a monitored OWW workflow turn live until monitoring finishes", async () => {
+    const runId = "12345678-1234-1234-1234-123456789abc";
+    const nativeCall = vi.fn<OwwWorkflow.WorkflowCall>().mockResolvedValue({
+      run_id: runId,
+      status: "RUNNING",
+      project: "oww",
+    });
+    let finishMonitoring!: () => void;
+    const monitoringFinished = new Promise<void>((resolve) => {
+      finishMonitoring = resolve;
+    });
+    const originalSubmit = OwwWorkflow.submitOwwRequest;
+    const submit = vi
+      .spyOn(OwwWorkflow, "submitOwwRequest")
+      .mockImplementation((request) => originalSubmit(request, nativeCall));
+    const monitor = vi
+      .spyOn(OwwWorkflow, "monitorOwwWorkflow")
+      .mockImplementation(() => monitoringFinished);
+    try {
+      const harness = await createHarness({
+        projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+      });
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("oww-live-workflow"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("oww-live-message"),
+            role: "user",
+            text: "Start new task: Add Calendar Connection Status",
+            attachments: [],
+          },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6-astra" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      await waitFor(() => monitor.mock.calls.length === 1);
+      let model = await harness.readModel();
+      await waitFor(async () => {
+        model = await harness.readModel();
+        return model.threads[0]!.session?.status === "running";
+      });
+      let session = model.threads[0]!.session;
+      expect(session?.status).toBe("running");
+      expect(session?.activeTurnId).toBe("oww-workflow:oww-live-message");
+
+      finishMonitoring();
+      await waitFor(async () => {
+        model = await harness.readModel();
+        return model.threads[0]!.session?.status === "stopped";
+      });
+      session = model.threads[0]!.session;
+      expect(session?.activeTurnId).toBeNull();
+    } finally {
+      finishMonitoring();
+      submit.mockRestore();
+      monitor.mockRestore();
+    }
+  });
 
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
     const harness = await createHarness();

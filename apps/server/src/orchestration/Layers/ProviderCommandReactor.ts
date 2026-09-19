@@ -2,6 +2,7 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  MessageId,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -10,7 +11,7 @@ import {
   ThreadId,
   type ProviderSession,
   type RuntimeMode,
-  type TurnId,
+  TurnId,
 } from "@t3tools/contracts";
 import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitations";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
@@ -56,6 +57,23 @@ import {
 } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import {
+  approvalActivityToNative,
+  commandActivityToNative,
+  completeStageActivity,
+  createOwwApprovalResolutionGuard,
+  fileActivityToNative,
+  parseOwwApprovalRequestId,
+  resolveOwwApprovalAction,
+  stageActivityToNative,
+  submitOwwRequest,
+  monitorOwwWorkflow,
+  workflowStageActivity,
+  type ApprovalActivity,
+  type WorkflowTelemetry,
+} from "../owwWorkflow.ts";
+import { formatWorkflowStatus } from "../owwWorkflowStatus.ts";
+
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
@@ -318,6 +336,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 }
 
 const make = Effect.gen(function* () {
+  const owwApprovalGuard = createOwwApprovalResolutionGuard();
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -1335,6 +1354,178 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    // Dispatch before provider auth/session/worktree setup. Failures never fall through.
+    const workflowProject = yield* resolveProject(thread.projectId);
+    const workflowTurnId = TurnId.make(`oww-workflow:${event.payload.messageId}`);
+    const workflowMessage = Effect.fn("workflowMessage")(function* (text: string) {
+      const messageId = MessageId.make(
+        `oww-workflow:${event.payload.messageId}:${yield* serverEventId()}`,
+      );
+      yield* orchestrationEngine.dispatch({
+        type: "thread.message.assistant.delta",
+        commandId: yield* serverCommandId("oww-workflow-message"),
+        threadId: thread.id,
+        messageId,
+        delta: text,
+        turnId: workflowTurnId,
+        createdAt: event.payload.createdAt,
+      });
+      yield* orchestrationEngine.dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: yield* serverCommandId("oww-workflow-complete"),
+        threadId: thread.id,
+        messageId,
+        turnId: workflowTurnId,
+        createdAt: event.payload.createdAt,
+      });
+    });
+    const workflowTelemetry = Effect.fn("workflowTelemetry")(function* (
+      activity: WorkflowTelemetry,
+    ) {
+      const eventId =
+        "execution_id" in activity && activity.execution_id && activity.sequence !== undefined
+          ? EventId.make(`oww-executor:${activity.execution_id}:${activity.sequence}`)
+          : yield* serverEventId();
+      const native =
+        activity.entry_kind === "command"
+          ? commandActivityToNative(activity, eventId, workflowTurnId)
+          : activity.entry_kind === "stage"
+            ? stageActivityToNative(activity, workflowTurnId)
+            : activity.entry_kind === "approval"
+              ? approvalActivityToNative(activity, workflowTurnId)
+              : fileActivityToNative(
+                  activity,
+                  eventId,
+                  DateTime.formatIso(yield* DateTime.now),
+                  workflowTurnId,
+                );
+      if (!native) return;
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("oww-workflow-command"),
+        threadId: thread.id,
+        activity: native,
+        createdAt: native.createdAt,
+      });
+    });
+    const setWorkflowSessionRunning = Effect.fn("setWorkflowSessionRunning")(function* () {
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* setThreadSession({
+        threadId: thread.id,
+        session: {
+          threadId: thread.id,
+          status: "running",
+          providerName: null,
+          providerInstanceId: thread.modelSelection.instanceId,
+          runtimeMode: thread.runtimeMode,
+          activeTurnId: workflowTurnId,
+          lastError: null,
+          updatedAt,
+        },
+        createdAt: updatedAt,
+      });
+    });
+    const stopWorkflowSession = Effect.fn("stopWorkflowSession")(function* () {
+      const current = yield* resolveThreadShell(thread.id);
+      if (
+        current?.session?.status !== "running" ||
+        current.session.activeTurnId !== workflowTurnId
+      ) {
+        return;
+      }
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* setThreadSession({
+        threadId: thread.id,
+        session: {
+          ...current.session,
+          status: "stopped",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt,
+        },
+        createdAt: updatedAt,
+      });
+    });
+    const workflowHandled = yield* Effect.tryPromise(() =>
+      submitOwwRequest({
+        workspace: workflowProject?.workspaceRoot ?? thread.worktreePath ?? "",
+        threadId: thread.id,
+        messageId: event.payload.messageId,
+        text: message.text,
+        hasAttachments: (message.attachments?.length ?? 0) > 0,
+      }),
+    ).pipe(
+      Effect.flatMap((submission) =>
+        Effect.gen(function* () {
+          if (!submission.handled) return false;
+          const id = submission.workflow.run_id;
+          // Persist a safe operational snapshot before any stage runs, including on a retry.
+          yield* workflowMessage(formatWorkflowStatus(submission.workflow));
+          if (submission.notice) yield* workflowMessage(submission.notice);
+          if (submission.resume) {
+            // Keep the synthetic workflow turn live while its detached monitor emits
+            // command heartbeats and file activity. Otherwise the web client folds
+            // those late events into an already-settled response.
+            yield* setWorkflowSessionRunning();
+            yield* Effect.tryPromise(() =>
+              monitorOwwWorkflow(
+                id,
+                (value) => Effect.runPromise(workflowMessage(formatWorkflowStatus(value))),
+                undefined,
+                (activity) => Effect.runPromise(workflowTelemetry(activity)),
+              ),
+            ).pipe(
+              Effect.catch((error) =>
+                workflowMessage(
+                  `Workflow ${id}: monitoring failed. Use Show workflow status for this ID. ${String(error)}`,
+                ),
+              ),
+              Effect.ensuring(stopWorkflowSession().pipe(Effect.ignoreCause({ log: true }))),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to finish Hatchet workflow monitor", {
+                  workflowId: id,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+              Effect.forkScoped,
+            );
+          }
+          return true;
+        }),
+      ),
+      Effect.catch((error) =>
+        workflowMessage(
+          `Workflow creation failed. Direct implementation is disabled. Retry the same message. ${
+            error instanceof Error
+              ? error.message
+              : String((error as { cause?: unknown }).cause ?? error)
+          }`,
+        ).pipe(Effect.as(true)),
+      ),
+    );
+    if (workflowHandled) {
+      // A resumed workflow owns the live session until its monitor reaches a
+      // terminal or human-wait state. Read-only/control responses stop here.
+      const current = yield* resolveThreadShell(thread.id);
+      if (current?.session?.activeTurnId !== workflowTurnId) {
+        yield* setThreadSession({
+          threadId: thread.id,
+          session: {
+            threadId: thread.id,
+            status: "stopped",
+            providerName: null,
+            providerInstanceId: thread.modelSelection.instanceId,
+            runtimeMode: thread.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+      }
+      return;
+    }
+
     const authCommandHandled = yield* Effect.gen(function* () {
       // Native account commands belong to the thread's existing provider session.
       const instanceId =
@@ -1660,6 +1851,176 @@ const make = Effect.gen(function* () {
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
+    const owwApproval = parseOwwApprovalRequestId(event.payload.requestId);
+    if (owwApproval) {
+      const requestId = String(event.payload.requestId);
+      if (!owwApprovalGuard.begin(requestId)) {
+        // Approval commands are delivered at least once. A second command for the
+        // same durable request must not call Hatchet again or surface a false error.
+        return;
+      }
+      const workflowTurnId = TurnId.make(`oww-workflow:${owwApproval.runId}`);
+      const appendWorkflowTelemetry = Effect.fn("appendOwwActionTelemetry")(function* (
+        activity: WorkflowTelemetry,
+      ) {
+        const eventId = yield* serverEventId();
+        const native =
+          activity.entry_kind === "command"
+            ? commandActivityToNative(activity, eventId, workflowTurnId)
+            : activity.entry_kind === "stage"
+              ? stageActivityToNative(activity, workflowTurnId)
+              : activity.entry_kind === "approval"
+                ? approvalActivityToNative(activity, workflowTurnId)
+                : fileActivityToNative(
+                    activity,
+                    eventId,
+                    DateTime.formatIso(yield* DateTime.now),
+                    workflowTurnId,
+                  );
+        if (!native) return;
+        yield* orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: yield* serverCommandId("oww-workflow-action"),
+          threadId: event.payload.threadId,
+          activity: native,
+          createdAt: native.createdAt,
+        });
+      });
+      const appendWorkflowMessage = Effect.fn("appendOwwActionMessage")(function* (text: string) {
+        const messageId = MessageId.make(`oww-workflow:${requestId}:${yield* serverEventId()}`);
+        yield* orchestrationEngine.dispatch({
+          type: "thread.message.assistant.delta",
+          commandId: yield* serverCommandId("oww-workflow-action-message"),
+          threadId: event.payload.threadId,
+          messageId,
+          delta: text,
+          turnId: workflowTurnId,
+          createdAt: event.payload.createdAt,
+        });
+        yield* orchestrationEngine.dispatch({
+          type: "thread.message.assistant.complete",
+          commandId: yield* serverCommandId("oww-workflow-action-complete"),
+          threadId: event.payload.threadId,
+          messageId,
+          turnId: workflowTurnId,
+          createdAt: event.payload.createdAt,
+        });
+      });
+      return yield* Effect.tryPromise(() =>
+        resolveOwwApprovalAction({
+          requestId,
+          decision: event.payload.decision,
+          threadId: event.payload.threadId,
+        }),
+      ).pipe(
+        Effect.flatMap((resolution) =>
+          Effect.gen(function* () {
+            if (!resolution.handled) {
+              return yield* appendProviderFailureActivity({
+                threadId: event.payload.threadId,
+                kind: "provider.approval.respond.failed",
+                summary: "Hatchet action rejected",
+                detail: `Stale pending approval request: ${requestId}. Hatchet did not recognize this action.`,
+                turnId: workflowTurnId,
+                createdAt: event.payload.createdAt,
+                requestId: event.payload.requestId,
+              });
+            }
+            owwApprovalGuard.resolve(requestId);
+            const observedAt = DateTime.formatIso(yield* DateTime.now);
+            const resolvedActivity: ApprovalActivity = {
+              entry_kind: "approval",
+              approval_state: "resolved",
+              request_id: requestId,
+              action: resolution.action,
+              run_id: owwApproval.runId,
+              observed_at: observedAt,
+              detail: "Hatchet action resolved",
+              ...(owwApproval.exactSha ? { exact_sha: owwApproval.exactSha } : {}),
+              ...(owwApproval.taskRunId ? { task_run_id: owwApproval.taskRunId } : {}),
+              decision: resolution.decision,
+            };
+            yield* appendWorkflowTelemetry(resolvedActivity);
+            if (resolution.action === "candidate" || resolution.action === "migration") {
+              // The operation result may already expose the next Hatchet stage. Complete the
+              // exact approval task represented by this control, never that newer stage.
+              const stage = workflowStageActivity(
+                {
+                  ...resolution.workflow,
+                  status: "RUNNING",
+                  current_task: "application-change",
+                  current_task_status: "WAITING",
+                  waiting_reason:
+                    resolution.action === "candidate"
+                      ? "candidate approval for the exact candidate SHA"
+                      : "migration approval for the exact merged SHA",
+                },
+                observedAt,
+              );
+              if (stage) {
+                const accepted = ["accept", "acceptForSession", "acceptAlways"].includes(
+                  resolution.decision,
+                );
+                yield* appendWorkflowTelemetry(
+                  completeStageActivity(stage, accepted ? "completed" : "cancelled", observedAt),
+                );
+              }
+            }
+            yield* appendWorkflowMessage(formatWorkflowStatus(resolution.workflow));
+            if (resolution.resume) {
+              yield* Effect.tryPromise(() =>
+                monitorOwwWorkflow(
+                  owwApproval.runId,
+                  (value) => Effect.runPromise(appendWorkflowMessage(formatWorkflowStatus(value))),
+                  undefined,
+                  (activity) => Effect.runPromise(appendWorkflowTelemetry(activity)),
+                ),
+              ).pipe(
+                Effect.catch(() =>
+                  appendWorkflowMessage(
+                    `Workflow ${owwApproval.runId}: monitoring stopped; use Show workflow status to reconnect.`,
+                  ),
+                ),
+                Effect.forkScoped,
+              );
+            }
+          }),
+        ),
+        Effect.catch(() =>
+          Effect.gen(function* () {
+            const staleDetail =
+              owwApproval.action === "retry"
+                ? "Retry action expired: this failed task has already changed state or was already retried. Refresh the workflow status before taking another action."
+                : "This approval action expired because the Hatchet workflow state changed. Refresh the workflow status before taking another action.";
+            // Close the durable-looking native card so a replayed old button cannot
+            // remain actionable after Hatchet has invalidated its request.
+            yield* appendWorkflowTelemetry({
+              entry_kind: "approval",
+              approval_state: "resolved",
+              request_id: requestId,
+              action: owwApproval.action,
+              run_id: owwApproval.runId,
+              observed_at: DateTime.formatIso(yield* DateTime.now),
+              detail: staleDetail,
+              ...(owwApproval.exactSha ? { exact_sha: owwApproval.exactSha } : {}),
+              ...(owwApproval.taskRunId ? { task_run_id: owwApproval.taskRunId } : {}),
+              decision: "decline",
+            });
+            yield* appendProviderFailureActivity({
+              threadId: event.payload.threadId,
+              kind: "provider.approval.respond.failed",
+              summary:
+                owwApproval.action === "retry" ? "Retry action expired" : "Hatchet action expired",
+              detail: staleDetail,
+              turnId: workflowTurnId,
+              createdAt: event.payload.createdAt,
+              requestId: event.payload.requestId,
+            });
+          }),
+        ),
+        Effect.ensuring(Effect.sync(() => owwApprovalGuard.finish(requestId))),
+      );
+    }
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
       return;

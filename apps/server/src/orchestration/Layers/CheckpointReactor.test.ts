@@ -497,6 +497,56 @@ describe("CheckpointReactor", () => {
     };
   }
 
+  effectIt.effect("OWW never captures implementation checkpoints or deletes historical refs", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+          seedFilesystemCheckpoints: true,
+        }),
+      );
+      const refsBefore = runGit(harness.cwd, ["for-each-ref", "refs/t3"]);
+      const headBefore = runGit(harness.cwd, ["rev-parse", "HEAD"]);
+      const statusBefore = runGit(harness.cwd, ["status", "--porcelain"]);
+      const now = "2026-01-01T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("oww-task"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: MessageId.make("oww-message"),
+          role: "user",
+          text: "Add Calendar Connection Status",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        createdAt: now,
+      });
+      harness.provider.emit({
+        type: "turn.started",
+        eventId: EventId.make("oww-start"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("oww-turn"),
+        createdAt: now,
+      });
+      harness.provider.emit({
+        type: "turn.completed",
+        eventId: EventId.make("oww-end"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("oww-turn"),
+        createdAt: now,
+        payload: { state: "completed" },
+      });
+      yield* Effect.promise(harness.drain);
+      expect(runGit(harness.cwd, ["for-each-ref", "refs/t3"])).toBe(refsBefore);
+      expect(runGit(harness.cwd, ["rev-parse", "HEAD"])).toBe(headBefore);
+      expect(runGit(harness.cwd, ["status", "--porcelain"])).toBe(statusBefore);
+    }),
+  );
+
   effectIt.effect("captures baseline and large turn summaries before completion receipts", () =>
     Effect.gen(function* () {
       const harness = yield* Effect.promise(() =>

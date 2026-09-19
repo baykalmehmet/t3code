@@ -94,6 +94,7 @@ export function useSelectedThreadRequests() {
   const selectedThread = useSelectedThreadDetail();
   const userInputDraftsByRequestKey = useAtomValue(userInputDraftsByRequestKeyAtom);
   const [respondingApprovalId, setRespondingApprovalId] = useState<ApprovalRequestId | null>(null);
+  const approvalResponsesInFlight = useRef(new Set<ApprovalRequestId>());
   const userInputResponsesInFlight = useRef(new Set<string>());
   const [respondingUserInputId, setRespondingUserInputId] = useState<ApprovalRequestId | null>(
     null,
@@ -105,6 +106,15 @@ export function useSelectedThreadRequests() {
   );
   const activePendingApproval = activePendingApprovals[0] ?? null;
   const activePendingUserInput = activePendingUserInputs[0] ?? null;
+  useEffect(() => {
+    const pendingRequestIds = new Set(activePendingApprovals.map((request) => request.requestId));
+    for (const requestId of approvalResponsesInFlight.current) {
+      if (!pendingRequestIds.has(requestId)) approvalResponsesInFlight.current.delete(requestId);
+    }
+    if (respondingApprovalId !== null && !pendingRequestIds.has(respondingApprovalId)) {
+      setRespondingApprovalId(null);
+    }
+  }, [activePendingApprovals, respondingApprovalId]);
   const questionServerConfigs = useServerConfigs();
   const attachmentDrafts = useAtomValue(composerDraftsAtom);
   const preparationCounts = useAtomValue(questionAttachmentPreparationAtom);
@@ -217,7 +227,9 @@ export function useSelectedThreadRequests() {
       if (!selectedThreadShell) {
         return;
       }
+      if (approvalResponsesInFlight.current.has(requestId)) return;
 
+      approvalResponsesInFlight.current.add(requestId);
       setRespondingApprovalId(requestId);
       const result = await respondToApproval({
         environmentId: selectedThreadShell.environmentId,
@@ -227,7 +239,10 @@ export function useSelectedThreadRequests() {
           decision,
         },
       });
-      setRespondingApprovalId((current) => (current === requestId ? null : current));
+      if (result._tag === "Failure") {
+        approvalResponsesInFlight.current.delete(requestId);
+        setRespondingApprovalId((current) => (current === requestId ? null : current));
+      }
       return result;
     },
     [respondToApproval, selectedThreadShell],

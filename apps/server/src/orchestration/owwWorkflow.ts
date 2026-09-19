@@ -193,6 +193,14 @@ export type WorkflowRecord = {
     operator_question?: string | null;
     diagnostic_evidence?: string[];
   } | null;
+  recovery_decision?: {
+    disposition?: string | null;
+    reason?: string | null;
+    strategy?: string | null;
+    attempt?: number | null;
+    operator_action_required?: boolean;
+  } | null;
+  candidate_history?: string[];
   validation_failed_check?: string | null;
   validation_failed_kind?: "build" | "test" | "restore" | "deployment" | "security" | null;
   validation_exit_code?: number | null;

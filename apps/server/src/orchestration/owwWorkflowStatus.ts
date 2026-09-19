@@ -461,6 +461,16 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
     if (diagnostic.operator_action_required && diagnostic.operator_question)
       detailSection(lines, "Operator input", safe(diagnostic.operator_question));
   }
+  if (value.recovery_decision) {
+    detailSection(lines, "Recovery disposition", safe(value.recovery_decision.disposition));
+    detailSection(
+      lines,
+      "Operator action",
+      value.recovery_decision.operator_action_required ? "Required" : "None currently required",
+    );
+  }
+  if (value.candidate_history?.length)
+    detailSection(lines, "Candidate history", value.candidate_history.map(shortSha).join(" → "));
   const failedCheck = safe(value.validation_failed_check);
   if (failedCheck) detailSection(lines, "❌ Failed check", failedCheck);
   if (Number.isInteger(value.validation_exit_code))

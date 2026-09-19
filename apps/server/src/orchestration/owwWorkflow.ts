@@ -201,6 +201,13 @@ export type WorkflowRecord = {
     operator_action_required?: boolean;
   } | null;
   candidate_history?: string[];
+  candidate_revisions?: Array<Record<string, unknown>>;
+  repair_attempts?: Array<Record<string, unknown>>;
+  active_candidate_sha?: string | null;
+  latest_candidate_sha?: string | null;
+  validated_candidate_sha?: string | null;
+  candidate_revision_count?: number;
+  recovery_phase?: string | null;
   validation_failed_check?: string | null;
   validation_failed_kind?: "build" | "test" | "restore" | "deployment" | "security" | null;
   validation_exit_code?: number | null;

@@ -471,6 +471,10 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   }
   if (value.candidate_history?.length)
     detailSection(lines, "Candidate history", value.candidate_history.map(shortSha).join(" → "));
+  if (value.candidate_revision_count)
+    detailSection(lines, "Candidate revisions", String(value.candidate_revision_count));
+  if (value.recovery_phase && value.recovery_phase !== "NONE")
+    detailSection(lines, "Recovery phase", safe(value.recovery_phase));
   const failedCheck = safe(value.validation_failed_check);
   if (failedCheck) detailSection(lines, "❌ Failed check", failedCheck);
   if (Number.isInteger(value.validation_exit_code))

@@ -448,6 +448,10 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   if (classification) detailSection(lines, "❌ Classification", classification);
   const diagnostic = value.failure_diagnostic;
   if (diagnostic) {
+    if (diagnostic.failure_category)
+      detailSection(lines, "Failure category", safe(diagnostic.failure_category));
+    if (diagnostic.failure_code)
+      detailSection(lines, "Failure reason code", safe(diagnostic.failure_code));
     detailSection(lines, "Failure reason", safe(diagnostic.summary));
     if (diagnostic.root_cause) detailSection(lines, "Root cause", safe(diagnostic.root_cause));
     if (diagnostic.recovery_strategy)
@@ -503,6 +507,13 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
     }
     if (value.retryable_task_id) {
       recovery.push("**Retry:** `retry` — replay the one explicitly failed task");
+    }
+    if (value.outcome === "attention_required" && value.failure_diagnostic) {
+      recovery.push(
+        value.candidate_sha
+          ? "**Fix it:** `repair: <instructions>` — continue from the preserved candidate"
+          : "**Retry executor:** `Fix it` — start the bounded recovery strategy with persisted diagnostics",
+      );
     }
     recovery.push("**Inspect:** `show workflow status` — refresh authoritative state");
     recovery.push("**Stop:** take no action and leave the candidate preserved");

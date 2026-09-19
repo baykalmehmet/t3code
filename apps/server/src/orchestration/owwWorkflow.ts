@@ -175,6 +175,7 @@ export type WorkflowRecord = {
   failure_diagnostic?: {
     failure_category?: string | null;
     failure_code?: string | null;
+    failure_code?: string | null;
     stage?: string | null;
     summary?: string | null;
     root_cause?: string | null;

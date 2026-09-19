@@ -446,6 +446,17 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   }
   const classification = safe(value.failure_classification);
   if (classification) detailSection(lines, "❌ Classification", classification);
+  const diagnostic = value.failure_diagnostic;
+  if (diagnostic) {
+    detailSection(lines, "Failure reason", safe(diagnostic.summary));
+    if (diagnostic.root_cause) detailSection(lines, "Root cause", safe(diagnostic.root_cause));
+    if (diagnostic.recovery_strategy)
+      detailSection(lines, "Recovery", safe(diagnostic.recovery_strategy));
+    if (diagnostic.recommended_actions?.length)
+      listSection(lines, "Recommended next actions", diagnostic.recommended_actions.map(safe));
+    if (diagnostic.operator_action_required && diagnostic.operator_question)
+      detailSection(lines, "Operator input", safe(diagnostic.operator_question));
+  }
   const failedCheck = safe(value.validation_failed_check);
   if (failedCheck) detailSection(lines, "❌ Failed check", failedCheck);
   if (Number.isInteger(value.validation_exit_code))

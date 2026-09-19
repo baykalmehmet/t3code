@@ -172,6 +172,26 @@ export type WorkflowRecord = {
   checks?: WorkflowCheck[];
   evidence?: WorkflowEvidence[];
   failure_classification?: string | null;
+  failure_diagnostic?: {
+    failure_category?: string | null;
+    failure_code?: string | null;
+    stage?: string | null;
+    summary?: string | null;
+    root_cause?: string | null;
+    raw_error?: string | null;
+    stderr_excerpt?: string | null;
+    stdout_excerpt?: string | null;
+    failed_command?: string | null;
+    exit_code?: number | null;
+    failed_check?: string | null;
+    candidate_sha?: string | null;
+    retryable?: boolean;
+    recovery_strategy?: string | null;
+    recommended_actions?: string[];
+    operator_action_required?: boolean;
+    operator_question?: string | null;
+    diagnostic_evidence?: string[];
+  } | null;
   validation_failed_check?: string | null;
   validation_failed_kind?: "build" | "test" | "restore" | "deployment" | "security" | null;
   validation_exit_code?: number | null;

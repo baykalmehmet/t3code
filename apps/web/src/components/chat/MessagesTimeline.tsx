@@ -2367,9 +2367,20 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
   const ctx = use(TimelineRowCtx);
   const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
   const messageId = String(row.message.id);
-  const workflowRunId = messageId.startsWith("oww-workflow-status:")
+  const stableWorkflowRunId = messageId.startsWith("oww-workflow-status:")
     ? messageId.slice("oww-workflow-status:".length)
     : null;
+  // Older authoritative status messages predate the stable projected message ID.
+  // Keep them actionable as well so users do not need to create a new status
+  // message (or start a new workflow) just to refresh an existing card.
+  const legacyWorkflowStatus =
+    messageText.includes("Authoritative workflow status") ||
+    messageText.includes("latest authoritative state");
+  const workflowRunId =
+    stableWorkflowRunId ??
+    (legacyWorkflowStatus
+      ? (messageText.match(/Hatchet run:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1] ?? "legacy")
+      : null);
 
   return (
     <>

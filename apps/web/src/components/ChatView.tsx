@@ -10510,6 +10510,7 @@ export default function ChatView(props: ChatViewProps) {
                   activeThreadShell?.latestRun ? (
                     <UsageLimitRecoveryCard
                       key={activeThreadShell.latestRun.runId}
+                      snoozedUntil={activeThreadShell.snoozedUntil}
                       stoppedAt={
                         activeThreadShell.latestRun.completedAt ?? activeThreadShell.updatedAt
                       }

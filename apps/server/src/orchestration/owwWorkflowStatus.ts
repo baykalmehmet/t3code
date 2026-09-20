@@ -382,6 +382,43 @@ const elapsed = (seconds?: number | null): string | undefined => {
   return `${String(minutes).padStart(2, "0")}m ${String(seconds % 60).padStart(2, "0")}s`;
 };
 
+const progressBar = (value: WorkflowRecord): string | undefined => {
+  const ordered = Object.keys(stages);
+  const current = value.current_task ?? value.stopped_at;
+  if (!current || !ordered.includes(current)) return undefined;
+  const tasks = value.tasks ?? [];
+  const completed = tasks.filter(
+    (task) => task.status === "COMPLETED" && task.name !== "application-change",
+  ).length;
+  const index = ordered.indexOf(current);
+  const total = ordered.length;
+  const raw = Math.max(completed, index + (value.current_task_status === "COMPLETED" ? 1 : 0));
+  const percent = Math.min(100, Math.round((raw / total) * 100));
+  const segments = 18;
+  const filled = Math.min(segments, Math.round((percent / 100) * segments));
+  return `${"━".repeat(filled)}${"░".repeat(segments - filled)} ${percent}%`;
+};
+
+const latestCommand = (value: WorkflowRecord): CommandActivity | undefined =>
+  (value.command_events ?? [])
+    .filter(
+      (command): command is CommandActivity =>
+        command.entry_kind === "command" && Boolean(safe(command.display_command)),
+    )
+    .at(-1);
+
+const liveTerminal = (value: WorkflowRecord): string | undefined => {
+  const command = latestCommand(value);
+  if (!command) return undefined;
+  const output = safeExcerpt(command.stdout_excerpt ?? command.stderr_excerpt);
+  const rows = [
+    route(value),
+    `$ ${safe(command.display_command)}`,
+    output,
+  ].filter((row): row is string => Boolean(row));
+  return rows.length > 1 ? rows.join("\n") : undefined;
+};
+
 const terminalState = (value: WorkflowRecord): string | undefined => {
   if (value.status !== "COMPLETED") return undefined;
   if (value.outcome === "attention_required") return "ATTENTION REQUIRED";
@@ -417,6 +454,7 @@ const header = (value: WorkflowRecord): string => {
 
 export function formatWorkflowProgress(value: WorkflowRecord): string {
   const lines = [header(value)];
+  const progress = progressBar(value);
   const secondary: string[] = [];
   const executor = route(value);
   if (executor) secondary.push(executor);
@@ -438,11 +476,17 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
     lines[0] = hardLine(lines[0] ?? header(value));
     lines.push(secondary.join(" • "));
   }
+  if (progress) lines.push(hardLine(progress));
 
   const command = activeCommand(value);
   if (command) {
     detailSection(lines, "▶ Current command", `$ ${safe(command.display_command)}`);
     detailSection(lines, "Command status", "Running");
+  }
+  const terminal = liveTerminal(value);
+  if (terminal) {
+    const command = latestCommand(value);
+    terminalSection(lines, command?.command_state === "started" ? "▶ Live terminal" : "Terminal", terminal);
   }
 
   if (value.current_task_status === "QUEUED") {

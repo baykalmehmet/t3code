@@ -36,6 +36,36 @@ describe("OWW Hatchet status", () => {
     expect(rendered).toContain("Waiting  \n02m 14s");
   });
 
+  it("renders milestone progress and a live terminal snapshot", () => {
+    const text = formatWorkflowProgress({
+      ...base,
+      current_task: "develop",
+      current_task_status: "RUNNING",
+      executor_provider: "codex",
+      executor_model: "gpt-5.6-sol",
+      executor_reasoning_effort: "high",
+      stage_elapsed_seconds: 78,
+      command_events: [
+        {
+          entry_kind: "command",
+          command_id: "cmd-tests",
+          stage: "develop",
+          display_command: "dotnet test oww.Tests/Oww.Tests.csproj",
+          command_state: "started",
+          started_at: "2026-01-01T00:00:00Z",
+          stdout_excerpt: "Running BookingEvidenceCollectorTests...",
+        },
+      ],
+    });
+
+    expect(text).toContain("% ");
+    expect(text).toContain("▶ Live terminal");
+    expect(text).toContain("Codex / gpt-5.6-sol • high reasoning");
+    expect(text).toContain("$ dotnet test oww.Tests/Oww.Tests.csproj");
+    expect(text).toContain("Running BookingEvidenceCollectorTests...");
+    expect(text).toContain("01m 18s");
+  });
+
   it("renders Hatchet-native fields without reconstructing a legacy state", () => {
     const text = formatWorkflowStatus({
       ...base,
@@ -180,6 +210,7 @@ describe("OWW Hatchet status", () => {
       [
         "🛠 Development • RUNNING  ",
         "Devin / swe-2-high",
+        "━━━░░░░░░░░░░░░░░░ 15%  ",
         "",
         "🎯 Current  ",
         "Running targeted frontend tests",
@@ -736,6 +767,7 @@ describe("OWW Hatchet status", () => {
       [
         "⬆️ Development • ESCALATED  ",
         "Codex / gpt-5.3-codex • high reasoning • Attempt 3/3",
+        "━━━░░░░░░░░░░░░░░░ 15%  ",
         "",
         "⚠️ Previous attempt  ",
         "NO_CANDIDATE_CHANGE",

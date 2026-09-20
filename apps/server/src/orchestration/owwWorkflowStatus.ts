@@ -5,6 +5,7 @@ import type {
   WorkflowCheck,
   WorkflowEvidence,
   WorkflowRecord,
+  RecoveryPrompt,
 } from "./owwWorkflow.ts";
 
 const sensitive =
@@ -64,6 +65,56 @@ const listSection = (lines: string[], heading: string, entries: Array<string | u
 };
 const terminalSection = (lines: string[], heading: string, value?: string) => {
   if (value) lines.push("", heading, "", "```text", value, "```");
+};
+
+const buildRecoveryPrompts = (value: WorkflowRecord): RecoveryPrompt[] => {
+  if (
+    value.status !== "COMPLETED" ||
+    value.outcome === "complete" ||
+    value.outcome === "smoke_complete"
+  )
+    return [];
+  const candidate = value.candidate_sha ?? "the preserved candidate SHA";
+  const check =
+    safe(value.validation_failed_check) ??
+    safe(value.failure_classification) ??
+    "the failed workflow step";
+  const command = safe(value.validation_command) ?? "the failed command shown in diagnostics";
+  const fingerprint = safe(value.validation_failure_fingerprint) ?? "not available";
+  const exit = Number.isInteger(value.validation_exit_code)
+    ? String(value.validation_exit_code)
+    : "unknown";
+  const evidence =
+    safeExcerpt(value.validation_stderr_excerpt ?? value.validation_stdout_excerpt) ??
+    "See the expandable workflow diagnostics.";
+  const context = `Failure: ${check}\nCommand: ${command}\nExit code: ${exit}\nFailure fingerprint: ${fingerprint}\nCandidate SHA: ${candidate}\nEvidence: ${evidence}`;
+  const prompts: RecoveryPrompt[] = [
+    {
+      option: "A",
+      title: "Fix with focused repair",
+      prompt: `Fix the failure in the existing workflow and candidate ${candidate}.\n\n${context}\n\nInspect the candidate diff and relevant source before editing. Make the smallest safe change, preserve requested behavior and safety gates, commit the repair on the existing workflow branch, return the exact new candidate SHA, then rerun the focused check followed by the required validation suite. Do not create a new workflow or bypass approvals.`,
+    },
+    {
+      option: "B",
+      title: "Diagnose without changing files",
+      prompt: `Diagnose this workflow failure without modifying files or changing workflow state.\n\n${context}\n\nClassify the cause as a production defect, incorrect test, fixture/setup issue, dependency/configuration issue, infrastructure issue, or unknown. Identify the strongest evidence, affected files, and smallest safe next action. State clearly when the root cause is not proven.`,
+    },
+    {
+      option: "C",
+      title: "Escalate repair strategy",
+      prompt: `Re-investigate and repair the failure in candidate ${candidate} using a stronger model and a changed strategy.\n\n${context}\n\nReview previous attempts and do not repeat an ineffective repair. Inspect relevant history and the candidate diff, make only evidence-supported changes, create a new candidate on the same workflow branch, and rerun the focused check before full validation.`,
+    },
+  ];
+  if (
+    (value.failure_classification ?? "").includes("DEPLOY") ||
+    (value.failure_classification ?? "").includes("HEALTH")
+  )
+    prompts.push({
+      option: "D",
+      title: "Diagnose deployment or roll back",
+      prompt: `Safely recover the deployment failure for candidate ${candidate}.\n\n${context}\n\nFirst inspect remote deployment state and the last healthy SHA. Do not retry blindly, run migrations, or modify data. If the release is unhealthy, prepare a rollback recommendation; otherwise report the exact safe retry command and required approval.`,
+    });
+  return prompts;
 };
 
 const keyFields = [
@@ -493,6 +544,19 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
     detailSection(lines, "🔁 Repairs", `${repairCount}/${value.validation_repair_limit ?? 2}`);
   const fingerprint = safe(value.validation_failure_fingerprint);
   if (fingerprint) detailSection(lines, "Failure fingerprint", fingerprint);
+  const prompts = value.recovery_prompts?.length
+    ? value.recovery_prompts
+    : buildRecoveryPrompts(value);
+  if (prompts.length) {
+    lines.push(
+      "",
+      "🛠 Recovery prompts",
+      "",
+      "Copy one complete prompt below to continue this workflow:",
+    );
+    for (const prompt of prompts)
+      lines.push("", `${prompt.option}. ${prompt.title}`, "```text", prompt.prompt, "```");
+  }
   terminalSection(lines, "Stdout", safeExcerpt(value.validation_stdout_excerpt));
   terminalSection(lines, "Stderr", safeExcerpt(value.validation_stderr_excerpt));
   const reviewFindings = (value.review_findings ?? [])

@@ -227,10 +227,17 @@ export type WorkflowRecord = {
   }>;
   pr_number?: number | null;
   next_action?: string | null;
+  recovery_prompts?: RecoveryPrompt[];
   retryable_task_id?: string | null;
   retryable_task_name?: string | null;
   compact_progress?: boolean;
   tasks?: WorkflowTask[];
+};
+
+export type RecoveryPrompt = {
+  option: string;
+  title: string;
+  prompt: string;
 };
 
 export type WorkflowStageState = "running" | "completed" | "failed" | "cancelled";

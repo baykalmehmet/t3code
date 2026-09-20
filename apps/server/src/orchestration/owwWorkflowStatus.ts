@@ -419,11 +419,9 @@ const liveTerminal = (value: WorkflowRecord): string | undefined => {
   const command = latestCommand(value);
   if (!command) return undefined;
   const output = safeExcerpt(command.stdout_excerpt ?? command.stderr_excerpt);
-  const rows = [
-    route(value),
-    `$ ${safe(command.display_command)}`,
-    output,
-  ].filter((row): row is string => Boolean(row));
+  const rows = [route(value), `$ ${safe(command.display_command)}`, output].filter(
+    (row): row is string => Boolean(row),
+  );
   return rows.length > 1 ? rows.join("\n") : undefined;
 };
 
@@ -494,7 +492,11 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   const terminal = liveTerminal(value);
   if (terminal) {
     const command = latestCommand(value);
-    terminalSection(lines, command?.command_state === "started" ? "▶ Live terminal" : "Terminal", terminal);
+    terminalSection(
+      lines,
+      command?.command_state === "started" ? "▶ Live terminal" : "Terminal",
+      terminal,
+    );
   }
 
   if (value.current_task_status === "QUEUED") {
@@ -684,6 +686,7 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   }
   detailSection(lines, "⏭ Next", safe(value.next_action));
   detailSection(lines, "👤 Required action", safe(value.required_human_action));
+  lines.push("", "↻ **Refresh** · send `show workflow status` for the latest authoritative state");
   return lines.join("\n");
 }
 

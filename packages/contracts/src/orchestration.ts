@@ -1470,6 +1470,8 @@ const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   delta: Schema.String,
+  /** Replace the projected message instead of appending a streaming chunk. */
+  replace: Schema.optional(Schema.Boolean),
   turnId: Schema.optional(TurnId),
   createdAt: IsoDateTime,
 });
@@ -1875,6 +1877,8 @@ export const ThreadMessageSentPayload = Schema.Struct({
   context: Schema.optional(OrchestrationMessageContext),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
+  /** Server-side status updates can replace one durable message in place. */
+  replace: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

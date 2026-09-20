@@ -34,6 +34,8 @@ describe("OWW Hatchet status", () => {
     expect(rendered).toContain("Resource  \nuat:zyncal");
     expect(rendered).toContain("Owner  \naaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     expect(rendered).toContain("Waiting  \n02m 14s");
+    expect(rendered).toContain("↻ **Refresh**");
+    expect(rendered).toContain("show workflow status");
   });
 
   it("renders milestone progress and a live terminal snapshot", () => {
@@ -95,7 +97,9 @@ describe("OWW Hatchet status", () => {
     });
 
     expect(text).toContain("$ devin executor --model swe-2-high --role developer [prompt omitted]");
-    expect(text).not.toContain("$ codex executor --model gpt-5.6-sol --role planner [prompt omitted]");
+    expect(text).not.toContain(
+      "$ codex executor --model gpt-5.6-sol --role planner [prompt omitted]",
+    );
   });
 
   it("renders Hatchet-native fields without reconstructing a legacy state", () => {
@@ -252,6 +256,8 @@ describe("OWW Hatchet status", () => {
         "- ✅ Located UAT label component",
         "- ✏️ Updated ClientApp/oww-web/src/app/UatLabel.tsx",
         "- ▶️ Running targeted frontend tests",
+        "",
+        "↻ **Refresh** · send `show workflow status` for the latest authoritative state",
       ].join("\n"),
     );
   });
@@ -832,6 +838,8 @@ describe("OWW Hatchet status", () => {
         "",
         "⏭ Next  ",
         "Measure candidate → deterministic Validation",
+        "",
+        "↻ **Refresh** · send `show workflow status` for the latest authoritative state",
       ].join("\n"),
     );
   });

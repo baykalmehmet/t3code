@@ -1939,7 +1939,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           role: command.type === "thread.message.reasoning.delta" ? "reasoning" : "assistant",
           text: command.delta,
           turnId: command.turnId ?? null,
-          streaming: true,
+          streaming: command.type === "thread.message.assistant.delta" && command.replace !== true,
+          ...(command.type === "thread.message.assistant.delta" && command.replace === true
+            ? { replace: true }
+            : {}),
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
         },

@@ -809,4 +809,27 @@ describe("OWW Hatchet status", () => {
     });
     expect(terminal).toContain("executor failed (exit -15)");
   });
+
+  it("shows complete recovery prompts for a terminal validation failure", () => {
+    const text = formatWorkflowProgress({
+      ...base,
+      status: "COMPLETED",
+      outcome: "attention_required",
+      current_task: "validate",
+      failure_classification: "BACKEND_UNIT_TESTS",
+      validation_failed_check: "AvailabilityServiceTests.ShouldRejectOverlap",
+      validation_command: "dotnet test oww.Tests/Oww.Tests.csproj --configuration Release",
+      validation_exit_code: 1,
+      validation_failure_fingerprint: "BACKEND_UNIT_TESTS:4ab99",
+      validation_stderr_excerpt: "Expected false but was true",
+      candidate_sha: "a".repeat(40),
+    });
+
+    expect(text).toContain("🛠 Recovery prompts");
+    expect(text).toContain("A. Fix with focused repair");
+    expect(text).toContain("B. Diagnose without changing files");
+    expect(text).toContain("C. Escalate repair strategy");
+    expect(text).toContain("AvailabilityServiceTests.ShouldRejectOverlap");
+    expect(text).not.toContain("/run/credentials");
+  });
 });

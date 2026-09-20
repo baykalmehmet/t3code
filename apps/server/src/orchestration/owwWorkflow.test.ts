@@ -428,6 +428,37 @@ describe("OWW native approval actions", () => {
     });
   });
 
+  it("maps Fix it to typed executor recovery for a completed attention run", async () => {
+    const attention: WorkflowRecord = {
+      ...base,
+      status: "COMPLETED",
+      outcome: "attention_required",
+      failure_diagnostic: {
+        failure_code: "EXECUTOR_PROCESS_EXITED",
+        summary: "executor exited before producing a candidate",
+      },
+    };
+    const call = vi.fn<WorkflowCall>().mockImplementation(async (name) => {
+      if (name === "get_run_details") return attention;
+      if (name === "recover_executor") return { ...attention, run_id: "87654321-4321-4321-4321-cba987654321", status: "QUEUED" };
+      return attention;
+    });
+    const result = await submitOwwRequest(
+      { ...request, threadId: "fix-it-thread", text: "Fix the application" },
+      call,
+    );
+    expect(result.resume).toBe(true);
+    call.mockClear();
+    await submitOwwRequest(
+      { ...request, threadId: "fix-it-thread", messageId: "fix-2", text: "Fix it" },
+      call,
+    );
+    expect(call).toHaveBeenLastCalledWith("recover_executor", {
+      run_id: runId,
+      t3_conversation_id: expect.stringMatching(/^t3-[a-f0-9]{64}$/),
+    });
+  });
+
   it("maps an explicit accepted cancel action to cancel_run", async () => {
     const call = vi
       .fn<WorkflowCall>()

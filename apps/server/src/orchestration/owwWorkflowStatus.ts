@@ -594,7 +594,11 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
       );
     }
     recovery.push("**Inspect:** `show workflow status` — refresh authoritative state");
-    recovery.push("**Stop:** take no action and leave the candidate preserved");
+    recovery.push(
+      value.candidate_sha
+        ? "**Stop:** take no action and leave the candidate preserved"
+        : "**Stop:** take no action and preserve the executor diagnostics",
+    );
     lines.push("", "🛠 Recovery options", "", ...recovery);
   }
   if (value.status === "COMPLETED" && !applicationDeliverySucceeded(value)) {

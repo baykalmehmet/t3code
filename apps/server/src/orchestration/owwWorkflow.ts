@@ -37,7 +37,8 @@ export type WorkflowOperation =
   | "approve_migration"
   | "reject_migration"
   | "cancel_run"
-  | "retry_failed_task";
+  | "retry_failed_task"
+  | "recover_executor";
 
 export type WorkflowTask = {
   task_id: string;
@@ -1091,6 +1092,7 @@ const controlKind = (
     )
   )
     return "retry_failed_task";
+  if (/^\s*(?:please\s+)?fix(?:\s+it)?\s*[.!]?$/i.test(text)) return "recover_executor";
   if (
     /^\s*(?:(?:show|check)\s+)?(?:(?:workflow|run)\s+)?(?:status|progress|continue)(?:\s+(?:workflow|run))?(?:\s+[0-9a-f-]{36})?\s*[.!]?\s*$/i.test(
       text,
@@ -1232,6 +1234,14 @@ export async function submitOwwRequest(
             "Retry requires exactly one explicitly failed Hatchet task; inspect run details first.",
         };
       const workflow = await call(control, { run_id: boundRun, task_run_id: failed[0]!.task_id });
+      return { handled: true, workflow, resume: true };
+    }
+    if (control === "recover_executor") {
+      const workflow = await call("recover_executor", {
+        run_id: boundRun,
+        t3_conversation_id: conversationCorrelation(request.threadId),
+      });
+      conversationRun.set(request.threadId, workflow.run_id);
       return { handled: true, workflow, resume: true };
     }
     return {

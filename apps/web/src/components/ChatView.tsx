@@ -8714,6 +8714,22 @@ export default function ChatView(props: ChatViewProps) {
     [activeThreadId, environmentId, respondToThreadApproval, setThreadError],
   );
 
+  const onRefreshWorkflowStatus = useCallback(
+    async (_runId: string) => {
+      const previousPrompt = promptRef.current;
+      if (previousPrompt.trim().length > 0 || isSendBusy || isConnecting) return;
+      promptRef.current = "show workflow status";
+      setComposerDraftPrompt(composerDraftTarget, "show workflow status");
+      try {
+        await onSend();
+      } finally {
+        promptRef.current = previousPrompt;
+        setComposerDraftPrompt(composerDraftTarget, previousPrompt);
+      }
+    },
+    [composerDraftTarget, isConnecting, isSendBusy, onSend, promptRef, setComposerDraftPrompt],
+  );
+
   const onRespondToUserInput = useCallback(
     async (requestId: ApprovalRequestId, answers: Record<string, unknown>) => {
       if (!activeThreadId || !activePendingUserInput || activePendingIsResponding) return;
@@ -9892,6 +9908,7 @@ export default function ChatView(props: ChatViewProps) {
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
+                onRefreshWorkflowStatus={onRefreshWorkflowStatus}
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
                 citationHistoryLoading={threadDetailLoading}
                 {...(!paintOnlyDisplayedTimeline

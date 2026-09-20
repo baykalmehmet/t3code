@@ -34,8 +34,7 @@ describe("OWW Hatchet status", () => {
     expect(rendered).toContain("Resource  \nuat:zyncal");
     expect(rendered).toContain("Owner  \naaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     expect(rendered).toContain("Waiting  \n02m 14s");
-    expect(rendered).toContain("↻ **Refresh**");
-    expect(rendered).toContain("show workflow status");
+    expect(rendered).toContain("↻ Use the **Refresh status** button below");
   });
 
   it("renders milestone progress and a live terminal snapshot", () => {
@@ -257,7 +256,7 @@ describe("OWW Hatchet status", () => {
         "- ✏️ Updated ClientApp/oww-web/src/app/UatLabel.tsx",
         "- ▶️ Running targeted frontend tests",
         "",
-        "↻ **Refresh** · send `show workflow status` for the latest authoritative state",
+        "↻ Use the **Refresh status** button below for the latest authoritative state.",
       ].join("\n"),
     );
   });
@@ -839,7 +838,7 @@ describe("OWW Hatchet status", () => {
         "⏭ Next  ",
         "Measure candidate → deterministic Validation",
         "",
-        "↻ **Refresh** · send `show workflow status` for the latest authoritative state",
+        "↻ Use the **Refresh status** button below for the latest authoritative state.",
       ].join("\n"),
     );
   });

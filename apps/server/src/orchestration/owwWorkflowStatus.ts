@@ -686,7 +686,7 @@ export function formatWorkflowProgress(value: WorkflowRecord): string {
   }
   detailSection(lines, "⏭ Next", safe(value.next_action));
   detailSection(lines, "👤 Required action", safe(value.required_human_action));
-  lines.push("", "↻ **Refresh** · send `show workflow status` for the latest authoritative state");
+  lines.push("", "↻ Use the **Refresh status** button below for the latest authoritative state.");
   return lines.join("\n");
 }
 

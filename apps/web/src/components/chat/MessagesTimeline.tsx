@@ -129,6 +129,7 @@ import {
   TerminalIcon,
   Undo2Icon,
   WrenchIcon,
+  RefreshCwIcon,
   XIcon,
   ZapIcon,
 } from "lucide-react";
@@ -299,6 +300,7 @@ interface TimelineRowSharedState {
   agentPanelModel: AgentPanelModel;
   expandedSpawnEntryIds: ReadonlySet<string>;
   onOpenAgents: () => void;
+  onRefreshWorkflowStatus: (runId: string) => void;
   onCancelWorktreeSetup: (() => void) | null;
   onWorktreeSetupWorkLocally: (() => void) | null;
   onOpenWorktreeSetupTerminal: ((terminalId: string) => void) | null;
@@ -407,6 +409,7 @@ interface MessagesTimelineProps {
   ) => boolean;
   agentPanelModel?: AgentPanelModel;
   onOpenAgents?: () => void;
+  onRefreshWorkflowStatus?: (runId: string) => void;
   isWorking: boolean;
   isPreparingWorktree?: boolean;
   isCompacting?: boolean;
@@ -490,6 +493,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnStartedAt,
   agentPanelModel,
   onOpenAgents = NOOP_OPEN_AGENTS,
+  onRefreshWorkflowStatus = NOOP_OPEN_AGENTS,
   listRef,
   timelineEntries,
   latestTurn,
@@ -1160,6 +1164,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       agentPanelModel: agentPanelModel ?? EMPTY_AGENT_PANEL_MODEL,
       expandedSpawnEntryIds: paintedExpandedSpawnEntryIds,
       onOpenAgents,
+      onRefreshWorkflowStatus,
       onCancelWorktreeSetup: onCancelWorktreeSetup ?? null,
       onWorktreeSetupWorkLocally: onWorktreeSetupWorkLocally ?? null,
       onOpenWorktreeSetupTerminal: onOpenWorktreeSetupTerminal ?? null,
@@ -1195,6 +1200,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       agentPanelModel,
       paintedExpandedSpawnEntryIds,
       onOpenAgents,
+      onRefreshWorkflowStatus,
       onCancelWorktreeSetup,
       onWorktreeSetupWorkLocally,
       onOpenWorktreeSetupTerminal,
@@ -2360,6 +2366,10 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
 function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
   const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
+  const messageId = String(row.message.id);
+  const workflowRunId = messageId.startsWith("oww-workflow-status:")
+    ? messageId.slice("oww-workflow-status:".length)
+    : null;
 
   return (
     <>
@@ -2384,6 +2394,19 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
             onImageExpand={ctx.onImageExpand}
           />
         </AssistantCitationSource>
+        {workflowRunId ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mt-1.5 h-7 gap-1.5 px-2 text-xs"
+            onClick={() => ctx.onRefreshWorkflowStatus(workflowRunId)}
+            aria-label="Refresh workflow status"
+          >
+            <RefreshCwIcon className="size-3" />
+            Refresh status
+          </Button>
+        ) : null}
         <AssistantChangedFilesSection
           turnSummary={row.assistantTurnDiffSummary}
           routeThreadKey={ctx.routeThreadKey}

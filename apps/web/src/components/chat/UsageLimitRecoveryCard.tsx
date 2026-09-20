@@ -23,7 +23,8 @@ export function UsageLimitRecoveryCard({
   const canSchedule = resetAt !== null && Date.parse(resetAt) > Date.parse(stoppedAt);
   const scheduled =
     recovery?.runId === runId && recovery.resetAt === resetAt && recovery.autoResume;
-  const snoozed = resetAt !== null && snoozedUntil === resetAt;
+  const snoozed =
+    resetAt !== null && snoozedUntil !== null && Date.parse(snoozedUntil) === Date.parse(resetAt);
   async function toggle(action: "resume" | "snooze") {
     if (resetAt === null || !canSchedule) return;
     setPending(true);

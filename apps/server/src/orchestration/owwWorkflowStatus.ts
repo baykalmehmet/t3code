@@ -370,6 +370,7 @@ const activeCommand = (value: WorkflowRecord): CommandActivity | undefined =>
     .filter(
       (command): command is CommandActivity =>
         command.entry_kind === "command" &&
+        (!value.current_task || command.stage === value.current_task) &&
         command.command_state === "started" &&
         Boolean(safe(command.display_command)),
     )
@@ -400,6 +401,13 @@ const progressBar = (value: WorkflowRecord): string | undefined => {
 };
 
 const latestCommand = (value: WorkflowRecord): CommandActivity | undefined =>
+  (value.command_events ?? [])
+    .filter(
+      (command): command is CommandActivity =>
+        command.entry_kind === "command" && Boolean(safe(command.display_command)),
+    )
+    .filter((command) => !value.current_task || command.stage === value.current_task)
+    .at(-1) ??
   (value.command_events ?? [])
     .filter(
       (command): command is CommandActivity =>

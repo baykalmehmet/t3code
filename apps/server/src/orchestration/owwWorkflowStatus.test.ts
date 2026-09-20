@@ -66,6 +66,38 @@ describe("OWW Hatchet status", () => {
     expect(text).toContain("01m 18s");
   });
 
+  it("does not show a prior-stage command as the live development terminal", () => {
+    const text = formatWorkflowProgress({
+      ...base,
+      current_task: "develop",
+      current_task_status: "RUNNING",
+      executor_provider: "devin",
+      executor_model: "swe-2-high",
+      command_events: [
+        {
+          entry_kind: "command",
+          command_id: "plan-codex",
+          stage: "plan",
+          display_command: "codex executor --model gpt-5.6-sol --role planner [prompt omitted]",
+          command_state: "completed",
+          started_at: "2026-01-01T00:00:00Z",
+          finished_at: "2026-01-01T00:00:10Z",
+        },
+        {
+          entry_kind: "command",
+          command_id: "develop-devin",
+          stage: "develop",
+          display_command: "devin executor --model swe-2-high --role developer [prompt omitted]",
+          command_state: "started",
+          started_at: "2026-01-01T00:01:00Z",
+        },
+      ],
+    });
+
+    expect(text).toContain("$ devin executor --model swe-2-high --role developer [prompt omitted]");
+    expect(text).not.toContain("$ codex executor --model gpt-5.6-sol --role planner [prompt omitted]");
+  });
+
   it("renders Hatchet-native fields without reconstructing a legacy state", () => {
     const text = formatWorkflowStatus({
       ...base,

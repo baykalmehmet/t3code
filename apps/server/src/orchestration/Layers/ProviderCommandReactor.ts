@@ -1,8 +1,8 @@
-import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
 import {
   type ChatAttachment,
   CommandId,
   EventId,
+  MessageId,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -11,10 +11,9 @@ import {
   ThreadId,
   type ProviderSession,
   type RuntimeMode,
-  type TurnId,
+  TurnId,
 } from "@t3tools/contracts";
 import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitations";
-import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -27,7 +26,6 @@ import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -36,7 +34,6 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import {
-  ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
   ProviderWorkspaceMissingError,
@@ -53,19 +50,30 @@ import {
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
-import {
-  formatThreadTitleContext,
-  type ThreadTitleMessage,
-} from "../../textGeneration/ThreadTitleContext.ts";
 import { canReplaceThreadTitle, DEFAULT_THREAD_TITLE } from "../threadTitles.ts";
 import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
 } from "../../serverSettings.ts";
-import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
-const isProviderAdapterProcessError = Schema.is(ProviderAdapterProcessError);
+import {
+  approvalActivityToNative,
+  commandActivityToNative,
+  completeStageActivity,
+  createOwwApprovalResolutionGuard,
+  fileActivityToNative,
+  parseOwwApprovalRequestId,
+  resolveOwwApprovalAction,
+  stageActivityToNative,
+  submitOwwRequest,
+  monitorOwwWorkflow,
+  workflowStageActivity,
+  type ApprovalActivity,
+  type WorkflowTelemetry,
+} from "../owwWorkflow.ts";
+import { formatWorkflowStatus } from "../owwWorkflowStatus.ts";
+
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
@@ -82,8 +90,7 @@ type ProviderIntentEvent = Extract<
       | "thread.approval-response-requested"
       | "thread.user-input-response-requested"
       | "thread.session-stop-requested"
-      | "thread.settled"
-      | "thread.session-set";
+      | "thread.settled";
   }
 >;
 
@@ -120,6 +127,125 @@ const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
+const MAX_REGENERATION_ATTACHMENTS = 4;
+const MAX_THREAD_TITLE_CONTEXT_CHARS = 8_000;
+const MAX_FIRST_USER_TITLE_CONTEXT_CHARS = 2_000;
+const THREAD_TITLE_CONTEXT_TRUNCATION_MARKER = "[Earlier content truncated]\n\n";
+const FIRST_USER_CONTEXT_TRUNCATION_MARKER = "\n[First user message truncated]";
+
+type ThreadTitleMessage = {
+  readonly role: "user" | "assistant" | "system";
+  readonly text: string;
+  readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+};
+
+function formatThreadTitleSection(message: ThreadTitleMessage): string | undefined {
+  if (message.role === "system") {
+    return undefined;
+  }
+  const text = assistantCitationsToPlainText(message.text).trim();
+  const attachmentSummary = (message.attachments ?? [])
+    .map((attachment) => attachment.name)
+    .join(", ");
+  const contents = [
+    ...(text.length > 0 ? [text] : []),
+    ...(attachmentSummary.length > 0 ? [`[Attachments: ${attachmentSummary}]`] : []),
+  ].join("\n");
+  return contents.length > 0 ? `${message.role.toUpperCase()}:\n${contents}` : undefined;
+}
+
+function limitFirstUserSection(section: string): string {
+  if (section.length <= MAX_FIRST_USER_TITLE_CONTEXT_CHARS) {
+    return section;
+  }
+  return `${section.slice(
+    0,
+    MAX_FIRST_USER_TITLE_CONTEXT_CHARS - FIRST_USER_CONTEXT_TRUNCATION_MARKER.length,
+  )}${FIRST_USER_CONTEXT_TRUNCATION_MARKER}`;
+}
+
+function collectRecentThreadTitleContext(
+  messages: ReadonlyArray<ThreadTitleMessage>,
+  maxChars: number,
+): {
+  readonly context: string;
+  readonly attachments: ReadonlyArray<ChatAttachment>;
+  readonly truncated: boolean;
+} {
+  let context = "";
+  let truncated = false;
+  const retainedAttachments: Array<ChatAttachment> = [];
+
+  for (const message of messages.toReversed()) {
+    const section = formatThreadTitleSection(message);
+    if (section === undefined) {
+      continue;
+    }
+
+    const separator = context.length > 0 ? "\n\n" : "";
+    const available = maxChars - context.length - separator.length;
+    if (section.length > available) {
+      if (available > 0) {
+        context = `${section.slice(-available)}${separator}${context}`;
+        retainedAttachments.unshift(...(message.attachments ?? []));
+      }
+      truncated = true;
+      break;
+    }
+    context = `${section}${separator}${context}`;
+    retainedAttachments.unshift(...(message.attachments ?? []));
+  }
+
+  return { context, attachments: retainedAttachments, truncated };
+}
+
+function formatThreadTitleContext(messages: ReadonlyArray<ThreadTitleMessage>): {
+  readonly message: string;
+  readonly attachments: ReadonlyArray<ChatAttachment>;
+} {
+  const recent = collectRecentThreadTitleContext(messages, MAX_THREAD_TITLE_CONTEXT_CHARS);
+  if (!recent.truncated) {
+    return {
+      message: recent.context,
+      attachments: recent.attachments.slice(-MAX_REGENERATION_ATTACHMENTS),
+    };
+  }
+
+  const firstUserMessage = messages.find(
+    (message) => message.role === "user" && formatThreadTitleSection(message),
+  );
+  const firstUserSection = firstUserMessage
+    ? formatThreadTitleSection(firstUserMessage)
+    : undefined;
+  if (!firstUserMessage || !firstUserSection) {
+    return {
+      message: `${THREAD_TITLE_CONTEXT_TRUNCATION_MARKER}${recent.context}`,
+      attachments: recent.attachments.slice(-MAX_REGENERATION_ATTACHMENTS),
+    };
+  }
+
+  const pinnedSection = limitFirstUserSection(firstUserSection);
+  const recentContextBudget =
+    MAX_THREAD_TITLE_CONTEXT_CHARS -
+    pinnedSection.length -
+    "\n\n".length -
+    THREAD_TITLE_CONTEXT_TRUNCATION_MARKER.length;
+  const retainedRecent = collectRecentThreadTitleContext(messages, recentContextBudget);
+  const pinnedAttachment = firstUserMessage.attachments?.[0];
+  const recentAttachments = retainedRecent.attachments.filter(
+    (attachment) => attachment.id !== pinnedAttachment?.id,
+  );
+
+  return {
+    message: `${pinnedSection}\n\n${THREAD_TITLE_CONTEXT_TRUNCATION_MARKER}${retainedRecent.context}`,
+    attachments: [
+      ...(pinnedAttachment ? [pinnedAttachment] : []),
+      ...recentAttachments.slice(
+        -(MAX_REGENERATION_ATTACHMENTS - (pinnedAttachment === undefined ? 0 : 1)),
+      ),
+    ],
+  };
+}
 
 function providerErrorLabel(value: string | undefined): string {
   const normalized = value?.trim();
@@ -210,6 +336,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 }
 
 const make = Effect.gen(function* () {
+  const owwApprovalGuard = createOwwApprovalResolutionGuard();
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -218,20 +345,9 @@ const make = Effect.gen(function* () {
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
   const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
-  /** Environment settings with the thread's project overrides applied. */
-  const projectSettingsForThread = Effect.fnUntraced(function* (threadId: ThreadId) {
-    const settings = yield* serverSettingsService.getSettings;
-    if (Object.keys(settings.projectSettingsOverrides).length === 0) return settings;
-    const thread = yield* projectionSnapshotQuery
-      .getThreadShellById(threadId)
-      .pipe(Effect.orElseSucceed(() => Option.none()));
-    return resolveProjectSettings(settings, Option.isSome(thread) ? thread.value.projectId : null)
-      .settings;
-  });
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
@@ -373,9 +489,6 @@ const make = Effect.gen(function* () {
   const formatFailureDetail = (cause: Cause.Cause<unknown>): string => {
     const failReason = cause.reasons.find(Cause.isFailReason);
     if (isProviderAdapterRequestError(failReason?.error)) {
-      return failReason.error.detail;
-    }
-    if (isProviderAdapterProcessError(failReason?.error)) {
       return failReason.error.detail;
     }
     if (isProviderAdapterValidationError(failReason?.error)) {
@@ -902,7 +1015,7 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
-      const settings = yield* projectSettingsForThread(input.threadId);
+      const settings = yield* serverSettingsService.getSettings;
       const modelSelection =
         settings.sourceControlWriterModelSelection === null
           ? settings.textGenerationModelSelection
@@ -950,14 +1063,11 @@ const make = Effect.gen(function* () {
       readonly messageText: string;
       readonly attachments?: ReadonlyArray<ChatAttachment>;
       readonly titleSeed?: string;
-      readonly expectedTitle: string;
-      readonly expectedVersion: CommandId | null;
     }) {
       const attachments = input.attachments ?? [];
       yield* Effect.gen(function* () {
-        const { textGenerationModelSelection: modelSelection } = yield* projectSettingsForThread(
-          input.threadId,
-        );
+        const { textGenerationModelSelection: modelSelection } =
+          yield* serverSettingsService.getSettings;
 
         const generated = yield* textGeneration
           .generateThreadTitle({
@@ -981,14 +1091,10 @@ const make = Effect.gen(function* () {
         }
 
         yield* orchestrationEngine.dispatch({
-          type: "thread.title.generate.complete",
+          type: "thread.meta.update",
           commandId: yield* serverCommandId("thread-title-rename"),
           threadId: input.threadId,
-          title: generated.title === DEFAULT_THREAD_TITLE ? input.expectedTitle : generated.title,
-          expectedTitle: input.expectedTitle,
-          expectedVersion: input.expectedVersion,
-          needsRefinement:
-            generated.needsRefinement === true || generated.title === DEFAULT_THREAD_TITLE,
+          title: generated.title,
         });
       }).pipe(
         Effect.catchCause((cause) =>
@@ -1001,29 +1107,6 @@ const make = Effect.gen(function* () {
       );
     },
   );
-
-  const maybeRefineThreadTitle = Effect.fn("maybeRefineThreadTitle")(function* (
-    threadId: ThreadId,
-  ) {
-    const thread = yield* resolveThreadShell(threadId);
-    if (
-      !thread?.titleState?.needsRefinement ||
-      thread.titleState.source !== "generated" ||
-      thread.titleRegeneration != null ||
-      thread.latestTurn?.state !== "completed" ||
-      thread.session?.status !== "ready"
-    )
-      return;
-    const detail = yield* resolveThreadDetail(threadId);
-    if (!detail || detail.messages.filter((message) => message.role === "user").length !== 1)
-      return;
-    yield* orchestrationEngine.dispatch({
-      type: "thread.title.refine",
-      commandId: yield* serverCommandId("thread-title-refine"),
-      threadId,
-      expectedVersion: thread.titleState.version,
-    });
-  });
 
   const regenerateThreadTitle = Effect.fn("regenerateThreadTitle")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.meta-updated" }>,
@@ -1053,10 +1136,8 @@ const make = Effect.gen(function* () {
         thread,
         projects: project ? [project] : [],
       }) ?? process.cwd();
-    const { textGenerationModelSelection: modelSelection } = resolveProjectSettings(
-      yield* serverSettingsService.getSettings,
-      thread.projectId,
-    ).settings;
+    const { textGenerationModelSelection: modelSelection } =
+      yield* serverSettingsService.getSettings;
     const generated = yield* textGeneration.generateThreadTitle({
       cwd,
       message,
@@ -1094,17 +1175,14 @@ const make = Effect.gen(function* () {
       ...(input.title !== undefined ? { title: input.title } : {}),
     });
   });
-  const findPendingThreadTitles = Effect.fn("findPendingThreadTitles")(function* () {
+  const findInterruptedThreadTitleRegenerations = Effect.fn(
+    "findInterruptedThreadTitleRegenerations",
+  )(function* () {
     const readModel = yield* projectionSnapshotQuery.getCommandReadModel();
-    return {
-      interruptedRegenerations: readModel.threads.flatMap((thread) => {
-        const requestId = thread.titleRegeneration?.requestId;
-        return requestId === undefined ? [] : [{ threadId: thread.id, requestId }];
-      }),
-      refinementThreadIds: readModel.threads
-        .filter((thread) => thread.titleState?.needsRefinement)
-        .map((thread) => thread.id),
-    };
+    return readModel.threads.flatMap((thread) => {
+      const requestId = thread.titleRegeneration?.requestId;
+      return requestId === undefined ? [] : [{ threadId: thread.id, requestId }];
+    });
   });
   const clearInterruptedThreadTitleRegenerations = Effect.fn(
     "clearInterruptedThreadTitleRegenerations",
@@ -1276,6 +1354,178 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    // Dispatch before provider auth/session/worktree setup. Failures never fall through.
+    const workflowProject = yield* resolveProject(thread.projectId);
+    const workflowTurnId = TurnId.make(`oww-workflow:${event.payload.messageId}`);
+    const workflowMessage = Effect.fn("workflowMessage")(function* (text: string) {
+      const messageId = MessageId.make(
+        `oww-workflow:${event.payload.messageId}:${yield* serverEventId()}`,
+      );
+      yield* orchestrationEngine.dispatch({
+        type: "thread.message.assistant.delta",
+        commandId: yield* serverCommandId("oww-workflow-message"),
+        threadId: thread.id,
+        messageId,
+        delta: text,
+        turnId: workflowTurnId,
+        createdAt: event.payload.createdAt,
+      });
+      yield* orchestrationEngine.dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: yield* serverCommandId("oww-workflow-complete"),
+        threadId: thread.id,
+        messageId,
+        turnId: workflowTurnId,
+        createdAt: event.payload.createdAt,
+      });
+    });
+    const workflowTelemetry = Effect.fn("workflowTelemetry")(function* (
+      activity: WorkflowTelemetry,
+    ) {
+      const eventId =
+        "execution_id" in activity && activity.execution_id && activity.sequence !== undefined
+          ? EventId.make(`oww-executor:${activity.execution_id}:${activity.sequence}`)
+          : yield* serverEventId();
+      const native =
+        activity.entry_kind === "command"
+          ? commandActivityToNative(activity, eventId, workflowTurnId)
+          : activity.entry_kind === "stage"
+            ? stageActivityToNative(activity, workflowTurnId)
+            : activity.entry_kind === "approval"
+              ? approvalActivityToNative(activity, workflowTurnId)
+              : fileActivityToNative(
+                  activity,
+                  eventId,
+                  DateTime.formatIso(yield* DateTime.now),
+                  workflowTurnId,
+                );
+      if (!native) return;
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("oww-workflow-command"),
+        threadId: thread.id,
+        activity: native,
+        createdAt: native.createdAt,
+      });
+    });
+    const setWorkflowSessionRunning = Effect.fn("setWorkflowSessionRunning")(function* () {
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* setThreadSession({
+        threadId: thread.id,
+        session: {
+          threadId: thread.id,
+          status: "running",
+          providerName: null,
+          providerInstanceId: thread.modelSelection.instanceId,
+          runtimeMode: thread.runtimeMode,
+          activeTurnId: workflowTurnId,
+          lastError: null,
+          updatedAt,
+        },
+        createdAt: updatedAt,
+      });
+    });
+    const stopWorkflowSession = Effect.fn("stopWorkflowSession")(function* () {
+      const current = yield* resolveThreadShell(thread.id);
+      if (
+        current?.session?.status !== "running" ||
+        current.session.activeTurnId !== workflowTurnId
+      ) {
+        return;
+      }
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* setThreadSession({
+        threadId: thread.id,
+        session: {
+          ...current.session,
+          status: "stopped",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt,
+        },
+        createdAt: updatedAt,
+      });
+    });
+    const workflowHandled = yield* Effect.tryPromise(() =>
+      submitOwwRequest({
+        workspace: workflowProject?.workspaceRoot ?? thread.worktreePath ?? "",
+        threadId: thread.id,
+        messageId: event.payload.messageId,
+        text: message.text,
+        hasAttachments: (message.attachments?.length ?? 0) > 0,
+      }),
+    ).pipe(
+      Effect.flatMap((submission) =>
+        Effect.gen(function* () {
+          if (!submission.handled) return false;
+          const id = submission.workflow.run_id;
+          // Persist a safe operational snapshot before any stage runs, including on a retry.
+          yield* workflowMessage(formatWorkflowStatus(submission.workflow));
+          if (submission.notice) yield* workflowMessage(submission.notice);
+          if (submission.resume) {
+            // Keep the synthetic workflow turn live while its detached monitor emits
+            // command heartbeats and file activity. Otherwise the web client folds
+            // those late events into an already-settled response.
+            yield* setWorkflowSessionRunning();
+            yield* Effect.tryPromise(() =>
+              monitorOwwWorkflow(
+                id,
+                (value) => Effect.runPromise(workflowMessage(formatWorkflowStatus(value))),
+                undefined,
+                (activity) => Effect.runPromise(workflowTelemetry(activity)),
+              ),
+            ).pipe(
+              Effect.catch((error) =>
+                workflowMessage(
+                  `Workflow ${id}: monitoring failed. Use Show workflow status for this ID. ${String(error)}`,
+                ),
+              ),
+              Effect.ensuring(stopWorkflowSession().pipe(Effect.ignoreCause({ log: true }))),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to finish Hatchet workflow monitor", {
+                  workflowId: id,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+              Effect.forkScoped,
+            );
+          }
+          return true;
+        }),
+      ),
+      Effect.catch((error) =>
+        workflowMessage(
+          `Workflow creation failed. Direct implementation is disabled. Retry the same message. ${
+            error instanceof Error
+              ? error.message
+              : String((error as { cause?: unknown }).cause ?? error)
+          }`,
+        ).pipe(Effect.as(true)),
+      ),
+    );
+    if (workflowHandled) {
+      // A resumed workflow owns the live session until its monitor reaches a
+      // terminal or human-wait state. Read-only/control responses stop here.
+      const current = yield* resolveThreadShell(thread.id);
+      if (current?.session?.activeTurnId !== workflowTurnId) {
+        yield* setThreadSession({
+          threadId: thread.id,
+          session: {
+            threadId: thread.id,
+            status: "stopped",
+            providerName: null,
+            providerInstanceId: thread.modelSelection.instanceId,
+            runtimeMode: thread.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+      }
+      return;
+    }
+
     const authCommandHandled = yield* Effect.gen(function* () {
       // Native account commands belong to the thread's existing provider session.
       const instanceId =
@@ -1350,15 +1600,10 @@ const make = Effect.gen(function* () {
         ...generationInput,
       }).pipe(Effect.forkScoped);
 
-      if (
-        thread.titleState?.source !== "manual" &&
-        canReplaceThreadTitle(thread.title, event.payload.titleSeed)
-      ) {
+      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
         yield* maybeGenerateThreadTitleForFirstTurn({
           threadId: event.payload.threadId,
           cwd: generationCwd,
-          expectedTitle: thread.title,
-          expectedVersion: thread.titleState?.version ?? null,
           ...generationInput,
         }).pipe(Effect.forkScoped);
       }
@@ -1477,10 +1722,7 @@ const make = Effect.gen(function* () {
     }
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
-      messageText: projectComposerContextForProvider({
-        text: message.text,
-        records: message.context?.records ?? [],
-      }),
+      messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
@@ -1609,6 +1851,176 @@ const make = Effect.gen(function* () {
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
+    const owwApproval = parseOwwApprovalRequestId(event.payload.requestId);
+    if (owwApproval) {
+      const requestId = String(event.payload.requestId);
+      if (!owwApprovalGuard.begin(requestId)) {
+        // Approval commands are delivered at least once. A second command for the
+        // same durable request must not call Hatchet again or surface a false error.
+        return;
+      }
+      const workflowTurnId = TurnId.make(`oww-workflow:${owwApproval.runId}`);
+      const appendWorkflowTelemetry = Effect.fn("appendOwwActionTelemetry")(function* (
+        activity: WorkflowTelemetry,
+      ) {
+        const eventId = yield* serverEventId();
+        const native =
+          activity.entry_kind === "command"
+            ? commandActivityToNative(activity, eventId, workflowTurnId)
+            : activity.entry_kind === "stage"
+              ? stageActivityToNative(activity, workflowTurnId)
+              : activity.entry_kind === "approval"
+                ? approvalActivityToNative(activity, workflowTurnId)
+                : fileActivityToNative(
+                    activity,
+                    eventId,
+                    DateTime.formatIso(yield* DateTime.now),
+                    workflowTurnId,
+                  );
+        if (!native) return;
+        yield* orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: yield* serverCommandId("oww-workflow-action"),
+          threadId: event.payload.threadId,
+          activity: native,
+          createdAt: native.createdAt,
+        });
+      });
+      const appendWorkflowMessage = Effect.fn("appendOwwActionMessage")(function* (text: string) {
+        const messageId = MessageId.make(`oww-workflow:${requestId}:${yield* serverEventId()}`);
+        yield* orchestrationEngine.dispatch({
+          type: "thread.message.assistant.delta",
+          commandId: yield* serverCommandId("oww-workflow-action-message"),
+          threadId: event.payload.threadId,
+          messageId,
+          delta: text,
+          turnId: workflowTurnId,
+          createdAt: event.payload.createdAt,
+        });
+        yield* orchestrationEngine.dispatch({
+          type: "thread.message.assistant.complete",
+          commandId: yield* serverCommandId("oww-workflow-action-complete"),
+          threadId: event.payload.threadId,
+          messageId,
+          turnId: workflowTurnId,
+          createdAt: event.payload.createdAt,
+        });
+      });
+      return yield* Effect.tryPromise(() =>
+        resolveOwwApprovalAction({
+          requestId,
+          decision: event.payload.decision,
+          threadId: event.payload.threadId,
+        }),
+      ).pipe(
+        Effect.flatMap((resolution) =>
+          Effect.gen(function* () {
+            if (!resolution.handled) {
+              return yield* appendProviderFailureActivity({
+                threadId: event.payload.threadId,
+                kind: "provider.approval.respond.failed",
+                summary: "Hatchet action rejected",
+                detail: `Stale pending approval request: ${requestId}. Hatchet did not recognize this action.`,
+                turnId: workflowTurnId,
+                createdAt: event.payload.createdAt,
+                requestId: event.payload.requestId,
+              });
+            }
+            owwApprovalGuard.resolve(requestId);
+            const observedAt = DateTime.formatIso(yield* DateTime.now);
+            const resolvedActivity: ApprovalActivity = {
+              entry_kind: "approval",
+              approval_state: "resolved",
+              request_id: requestId,
+              action: resolution.action,
+              run_id: owwApproval.runId,
+              observed_at: observedAt,
+              detail: "Hatchet action resolved",
+              ...(owwApproval.exactSha ? { exact_sha: owwApproval.exactSha } : {}),
+              ...(owwApproval.taskRunId ? { task_run_id: owwApproval.taskRunId } : {}),
+              decision: resolution.decision,
+            };
+            yield* appendWorkflowTelemetry(resolvedActivity);
+            if (resolution.action === "candidate" || resolution.action === "migration") {
+              // The operation result may already expose the next Hatchet stage. Complete the
+              // exact approval task represented by this control, never that newer stage.
+              const stage = workflowStageActivity(
+                {
+                  ...resolution.workflow,
+                  status: "RUNNING",
+                  current_task: "application-change",
+                  current_task_status: "WAITING",
+                  waiting_reason:
+                    resolution.action === "candidate"
+                      ? "candidate approval for the exact candidate SHA"
+                      : "migration approval for the exact merged SHA",
+                },
+                observedAt,
+              );
+              if (stage) {
+                const accepted = ["accept", "acceptForSession", "acceptAlways"].includes(
+                  resolution.decision,
+                );
+                yield* appendWorkflowTelemetry(
+                  completeStageActivity(stage, accepted ? "completed" : "cancelled", observedAt),
+                );
+              }
+            }
+            yield* appendWorkflowMessage(formatWorkflowStatus(resolution.workflow));
+            if (resolution.resume) {
+              yield* Effect.tryPromise(() =>
+                monitorOwwWorkflow(
+                  owwApproval.runId,
+                  (value) => Effect.runPromise(appendWorkflowMessage(formatWorkflowStatus(value))),
+                  undefined,
+                  (activity) => Effect.runPromise(appendWorkflowTelemetry(activity)),
+                ),
+              ).pipe(
+                Effect.catch(() =>
+                  appendWorkflowMessage(
+                    `Workflow ${owwApproval.runId}: monitoring stopped; use Show workflow status to reconnect.`,
+                  ),
+                ),
+                Effect.forkScoped,
+              );
+            }
+          }),
+        ),
+        Effect.catch(() =>
+          Effect.gen(function* () {
+            const staleDetail =
+              owwApproval.action === "retry"
+                ? "Retry action expired: this failed task has already changed state or was already retried. Refresh the workflow status before taking another action."
+                : "This approval action expired because the Hatchet workflow state changed. Refresh the workflow status before taking another action.";
+            // Close the durable-looking native card so a replayed old button cannot
+            // remain actionable after Hatchet has invalidated its request.
+            yield* appendWorkflowTelemetry({
+              entry_kind: "approval",
+              approval_state: "resolved",
+              request_id: requestId,
+              action: owwApproval.action,
+              run_id: owwApproval.runId,
+              observed_at: DateTime.formatIso(yield* DateTime.now),
+              detail: staleDetail,
+              ...(owwApproval.exactSha ? { exact_sha: owwApproval.exactSha } : {}),
+              ...(owwApproval.taskRunId ? { task_run_id: owwApproval.taskRunId } : {}),
+              decision: "decline",
+            });
+            yield* appendProviderFailureActivity({
+              threadId: event.payload.threadId,
+              kind: "provider.approval.respond.failed",
+              summary:
+                owwApproval.action === "retry" ? "Retry action expired" : "Hatchet action expired",
+              detail: staleDetail,
+              turnId: workflowTurnId,
+              createdAt: event.payload.createdAt,
+              requestId: event.payload.requestId,
+            });
+          }),
+        ),
+        Effect.ensuring(Effect.sync(() => owwApprovalGuard.finish(requestId))),
+      );
+    }
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
       return;
@@ -1778,13 +2190,7 @@ const make = Effect.gen(function* () {
     });
     switch (event.type) {
       case "thread.meta-updated":
-        if (event.payload.regenerateTitle) yield* threadTitleRegenerationWorker.enqueue(event);
-        else if (event.payload.titleState?.needsRefinement)
-          yield* maybeRefineThreadTitle(event.payload.threadId);
-        return;
-      case "thread.session-set":
-        if (event.payload.session.status === "ready")
-          yield* maybeRefineThreadTitle(event.payload.threadId);
+        yield* threadTitleRegenerationWorker.enqueue(event);
         return;
       case "thread.runtime-mode-set": {
         const thread = yield* resolveThreadShell(event.payload.threadId);
@@ -1792,23 +2198,16 @@ const make = Effect.gen(function* () {
           return;
         }
         const cachedModelSelection = threadModelSelections.get(event.payload.threadId);
-        const resume = ensureSessionForThread(
+        yield* ensureSessionForThread(
           event.payload.threadId,
           event.occurredAt,
           cachedModelSelection !== undefined ? { modelSelection: cachedModelSelection } : {},
         );
-        yield* thread.worktreePath
-          ? withWorkspaceLease(path.resolve(thread.worktreePath), resume)
-          : resume;
         return;
       }
-      case "thread.turn-start-requested": {
-        const thread = yield* resolveThreadShell(event.payload.threadId);
-        yield* thread?.worktreePath
-          ? withWorkspaceLease(path.resolve(thread.worktreePath), processTurnStartRequested(event))
-          : processTurnStartRequested(event);
+      case "thread.turn-start-requested":
+        yield* processTurnStartRequested(event);
         return;
-      }
       case "thread.turn-interrupt-requested":
         yield* processTurnInterruptRequested(event);
         return;
@@ -1866,23 +2265,20 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
-    const pendingTitles = yield* findPendingThreadTitles().pipe(
+    const interruptedTitleRegenerations = yield* findInterruptedThreadTitleRegenerations().pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.interrupt;
         }
-        return Effect.logWarning("provider command reactor failed to find pending thread titles", {
-          failureKind: Cause.hasDies(cause) ? "defect" : "failure",
-          reasonCount: cause.reasons.length,
-        }).pipe(Effect.as({ interruptedRegenerations: [], refinementThreadIds: [] }));
+        return Effect.logWarning(
+          "provider command reactor failed to find interrupted title regenerations",
+          { cause: Cause.pretty(cause) },
+        ).pipe(Effect.as([]));
       }),
     );
     const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
       if (
-        (event.type === "thread.meta-updated" &&
-          (event.payload.regenerateTitle === true ||
-            event.payload.titleState?.needsRefinement === true)) ||
-        (event.type === "thread.session-set" && event.payload.session.status === "ready") ||
+        (event.type === "thread.meta-updated" && event.payload.regenerateTitle === true) ||
         event.type === "thread.runtime-mode-set" ||
         event.type === "thread.turn-start-requested" ||
         event.type === "thread.turn-interrupt-requested" ||
@@ -1899,34 +2295,29 @@ const make = Effect.gen(function* () {
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(Stream.runForEach(domainEvents, processEvent));
 
-    // Earlier events do not replay. Clear interrupted requests by their captured
-    // IDs, then schedule persisted refinements after subscribing to their events.
-    const recoverTitles = clearInterruptedThreadTitleRegenerations(
-      pendingTitles.interruptedRegenerations,
+    // The domain event stream is hot, so work pending before this reactor
+    // starts cannot be resumed. Correlated completions only clear the request
+    // captured here, leaving any newer request untouched.
+    const clearInterrupted = clearInterruptedThreadTitleRegenerations(
+      interruptedTitleRegenerations,
     ).pipe(
-      Effect.andThen(
-        Effect.forEach(pendingTitles.refinementThreadIds, maybeRefineThreadTitle, {
-          discard: true,
-        }),
-      ),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.interrupt;
         }
         return Effect.logWarning(
-          "provider command reactor failed to recover pending thread titles",
+          "provider command reactor failed to clear interrupted title regenerations",
           {
-            failureKind: Cause.hasDies(cause) ? "defect" : "failure",
-            reasonCount: cause.reasons.length,
+            cause: Cause.pretty(cause),
           },
         );
       }),
     );
     const activation = yield* ServerActivation;
     if (activation === undefined) {
-      yield* recoverTitles;
+      yield* clearInterrupted;
     } else {
-      yield* forkParked(recoverTitles);
+      yield* forkParked(clearInterrupted);
     }
   });
 

@@ -1,3 +1,4 @@
+import { isOwwWorkspace } from "../owwWorkflow.ts";
 import {
   CommandId,
   type CheckpointRef,
@@ -915,6 +916,12 @@ const make = Effect.gen(function* () {
   });
 
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (event: OrchestrationEvent) {
+    if (!("threadId" in event.payload)) return;
+    const guardedThread = yield* resolveThreadDetail(event.payload.threadId);
+    if (guardedThread) {
+      const projects = yield* resolveThreadProjects(guardedThread.projectId);
+      if (projects.some((project) => isOwwWorkspace(project.workspaceRoot))) return;
+    }
     if (event.type === "thread.turn-start-requested" || event.type === "thread.message-sent") {
       if (event.type === "thread.turn-start-requested") pending.add(event.payload.threadId);
       yield* ensurePreTurnBaselineFromDomainTurnStart(event);
@@ -941,6 +948,11 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
+    const guardedThread = yield* resolveThreadDetail(event.threadId);
+    if (guardedThread) {
+      const projects = yield* resolveThreadProjects(guardedThread.projectId);
+      if (projects.some((project) => isOwwWorkspace(project.workspaceRoot))) return;
+    }
     if (event.type === "session.exited") {
       startedTurns.delete(event.threadId);
       pending.delete(event.threadId);

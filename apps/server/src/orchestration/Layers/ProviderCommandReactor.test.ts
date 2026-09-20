@@ -15,7 +15,6 @@ import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
   CommandId,
-  ComposerContextId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EnvironmentId,
   EventId,
@@ -74,6 +73,8 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ServerActivation } from "../../serverActivation.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+
+import * as OwwWorkflow from "../owwWorkflow.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -168,8 +169,7 @@ describe("ProviderCommandReactor", () => {
 
   async function createHarness(input?: {
     readonly baseDir?: string;
-    readonly initialTitle?: string;
-    readonly deferReactorStart?: boolean;
+    readonly projectWorkspaceRoot?: string;
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
@@ -508,7 +508,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-project-create"),
         projectId: asProjectId("project-1"),
         title: "Provider Project",
-        workspaceRoot: "/tmp/provider-project",
+        workspaceRoot: input?.projectWorkspaceRoot ?? "/tmp/provider-project",
         defaultModelSelection: modelSelection,
         createdAt: now,
       }),
@@ -519,7 +519,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-thread-create"),
         threadId: ThreadId.make("thread-1"),
         projectId: asProjectId("project-1"),
-        title: input?.initialTitle ?? "Thread",
+        title: "Thread",
         modelSelection: modelSelection,
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
@@ -582,17 +582,14 @@ describe("ProviderCommandReactor", () => {
     }
 
     scope = await Effect.runPromise(Scope.make("sequential"));
-    const reactorScope = scope;
-    const startReactor = () =>
-      Effect.runPromise(
-        reactor
-          .start()
-          .pipe(
-            Scope.provide(reactorScope),
-            Effect.provideService(ServerActivation, input?.serverActivation),
-          ),
-      );
-    if (!input?.deferReactorStart) await startReactor();
+    await Effect.runPromise(
+      reactor
+        .start()
+        .pipe(
+          Scope.provide(scope),
+          Effect.provideService(ServerActivation, input?.serverActivation),
+        ),
+    );
     const drain = () => Effect.runPromise(reactor.drain);
 
     return {
@@ -627,7 +624,6 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions,
       stateDir,
       drain,
-      startReactor,
       runEffect,
       get titleRegenerationCompletionDispatchAttempts() {
         return titleRegenerationCompletionDispatchAttempts;
@@ -849,6 +845,258 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  it.each(["success", "failure", "read_only", "approval", "rejected"] as const)(
+    "OWW dispatch %s keeps implementation out of T3",
+    async (mode) => {
+      const runId = "12345678-1234-1234-1234-123456789abc";
+      const approvalWorkflow = {
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+        candidate_sha: mode === "rejected" ? null : "5201a8709a344dea8b00491bc2b6da461785761b",
+        current_task: "application-change",
+        current_task_status: "WAITING",
+        required_human_action: "candidate decision for the exact SHA",
+      };
+      const nativeCall = vi.fn<OwwWorkflow.WorkflowCall>().mockResolvedValue({
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+      });
+      if (mode === "failure") nativeCall.mockRejectedValue(new Error("API unavailable"));
+      if (mode === "approval" || mode === "rejected")
+        nativeCall.mockImplementation(async (name, args) => {
+          expect(args.run_id).toBe(approvalWorkflow.run_id);
+          if (name === "get_run_details") return approvalWorkflow;
+          if (mode === "approval" && name === "approve_candidate")
+            return {
+              ...approvalWorkflow,
+              current_task_status: "RUNNING",
+              required_human_action: null,
+            };
+          throw new Error(`unexpected operation: ${name}`);
+        });
+      let submitted!: () => void;
+      const submissionStarted = new Promise<void>((resolve) => {
+        submitted = resolve;
+      });
+      const originalSubmit = OwwWorkflow.submitOwwRequest;
+      const submit = vi.spyOn(OwwWorkflow, "submitOwwRequest").mockImplementation((request) => {
+        submitted();
+        return originalSubmit(request, nativeCall);
+      });
+      const monitor = vi.spyOn(OwwWorkflow, "monitorOwwWorkflow").mockResolvedValue(undefined);
+      try {
+        const harness = await createHarness({
+          projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+        });
+        const now = "2026-01-01T00:00:00.000Z";
+        await harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make("oww-task"),
+            threadId: ThreadId.make("thread-1"),
+            message: {
+              messageId: asMessageId("oww-message"),
+              role: "user",
+              text:
+                mode === "read_only"
+                  ? "Explain this code"
+                  : mode === "approval" || mode === "rejected"
+                    ? `Approve candidate ${runId} for 5201a8709a344dea8b00491bc2b6da461785761b`
+                    : "Add Calendar Connection Status",
+              attachments: [],
+            },
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6-astra" },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        );
+        await submissionStarted;
+        await harness.drain();
+        if (mode === "read_only") {
+          expect(harness.sendTurn).toHaveBeenCalled();
+          expect(nativeCall).not.toHaveBeenCalled();
+        } else {
+          expect(harness.startSession).not.toHaveBeenCalled();
+          expect(harness.sendTurn).not.toHaveBeenCalled();
+          expect(harness.createWorktree).not.toHaveBeenCalled();
+          expect(harness.renameBranch).not.toHaveBeenCalled();
+          expect(harness.generateBranchName).not.toHaveBeenCalled();
+          const model = await harness.readModel();
+          const messages = model.threads[0]!.messages.map((message) => message.text).join("\n");
+          expect(messages).toContain(
+            mode === "success"
+              ? runId
+              : mode === "approval" || mode === "rejected"
+                ? runId
+                : "Workflow creation failed",
+          );
+          expect(await harness.readPendingTurnStarts()).toEqual([]);
+          if (mode === "approval" || mode === "rejected") {
+            expect(nativeCall.mock.calls.map(([name]) => name)).toEqual([
+              "get_run_details",
+              ...(mode === "approval" ? ["approve_candidate"] : []),
+            ]);
+            expect(nativeCall).not.toHaveBeenCalledWith("start_task", expect.anything());
+            if (mode === "approval")
+              expect(monitor).toHaveBeenCalledWith(
+                runId,
+                expect.any(Function),
+                undefined,
+                expect.any(Function),
+              );
+            else expect(monitor).not.toHaveBeenCalled();
+            if (mode === "rejected") {
+              expect(messages).toContain(
+                "Candidate decision rejected: Hatchet has no exact candidate SHA",
+              );
+            }
+          } else if (mode === "success")
+            expect(Object.keys(nativeCall.mock.calls[0]![1]).sort()).toEqual([
+              "execution_profile",
+              "project_id",
+              "request_id",
+              "t3_conversation_id",
+              "task",
+              "work_kind",
+            ]);
+          if (mode === "failure") expect(monitor).not.toHaveBeenCalled();
+        }
+      } finally {
+        submit.mockRestore();
+        monitor.mockRestore();
+      }
+    },
+  );
+
+  it("coalesces duplicate OWW approval commands after the first decision is resolved", async () => {
+    const runId = "12345678-1234-1234-1234-123456789abc";
+    const candidateSha = "5201a8709a344dea8b00491bc2b6da461785761b";
+    const requestId = asApprovalRequestId(`hatchet:${runId}:candidate:${candidateSha}`);
+    const resolveApproval = vi.spyOn(OwwWorkflow, "resolveOwwApprovalAction").mockResolvedValue({
+      handled: true,
+      action: "candidate",
+      decision: "accept",
+      resume: false,
+      workflow: {
+        run_id: runId,
+        status: "RUNNING",
+        project: "oww",
+        candidate_sha: candidateSha,
+        current_task: "pull-request",
+        current_task_status: "RUNNING",
+        required_human_action: null,
+      },
+    });
+    try {
+      const harness = await createHarness({
+        projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+      });
+      const dispatchApproval = (commandId: string) =>
+        harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.approval.respond",
+            commandId: CommandId.make(commandId),
+            threadId: ThreadId.make("thread-1"),
+            requestId,
+            decision: "accept",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+        );
+
+      await dispatchApproval("oww-candidate-approval-first");
+      await waitFor(() => resolveApproval.mock.calls.length === 1);
+      await harness.drain();
+      await dispatchApproval("oww-candidate-approval-duplicate");
+      await harness.drain();
+
+      expect(resolveApproval).toHaveBeenCalledTimes(1);
+      const model = await harness.readModel();
+      const thread = model.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      const requestActivities = thread?.activities.filter(
+        (activity) =>
+          typeof activity.payload === "object" &&
+          activity.payload !== null &&
+          (activity.payload as Record<string, unknown>).requestId === requestId,
+      );
+      expect(
+        requestActivities?.filter((activity) => activity.kind === "approval.resolved"),
+      ).toHaveLength(1);
+      expect(
+        requestActivities?.filter(
+          (activity) => activity.kind === "provider.approval.respond.failed",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      resolveApproval.mockRestore();
+    }
+  });
+
+  it("keeps a monitored OWW workflow turn live until monitoring finishes", async () => {
+    const runId = "12345678-1234-1234-1234-123456789abc";
+    const nativeCall = vi.fn<OwwWorkflow.WorkflowCall>().mockResolvedValue({
+      run_id: runId,
+      status: "RUNNING",
+      project: "oww",
+    });
+    let finishMonitoring!: () => void;
+    const monitoringFinished = new Promise<void>((resolve) => {
+      finishMonitoring = resolve;
+    });
+    const originalSubmit = OwwWorkflow.submitOwwRequest;
+    const submit = vi
+      .spyOn(OwwWorkflow, "submitOwwRequest")
+      .mockImplementation((request) => originalSubmit(request, nativeCall));
+    const monitor = vi
+      .spyOn(OwwWorkflow, "monitorOwwWorkflow")
+      .mockImplementation(() => monitoringFinished);
+    try {
+      const harness = await createHarness({
+        projectWorkspaceRoot: "/opt/agent-platform/projects/oww/worktrees/zyncal-next-product",
+      });
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("oww-live-workflow"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("oww-live-message"),
+            role: "user",
+            text: "Start new task: Add Calendar Connection Status",
+            attachments: [],
+          },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6-astra" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      await waitFor(() => monitor.mock.calls.length === 1);
+      let model = await harness.readModel();
+      await waitFor(async () => {
+        model = await harness.readModel();
+        return model.threads[0]!.session?.status === "running";
+      });
+      let session = model.threads[0]!.session;
+      expect(session?.status).toBe("running");
+      expect(session?.activeTurnId).toBe("oww-workflow:oww-live-message");
+
+      finishMonitoring();
+      await waitFor(async () => {
+        model = await harness.readModel();
+        return model.threads[0]!.session?.status === "stopped";
+      });
+      session = model.threads[0]!.session;
+      expect(session?.activeTurnId).toBeNull();
+    } finally {
+      finishMonitoring();
+      submit.mockRestore();
+      monitor.mockRestore();
+    }
+  });
+
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -888,51 +1136,6 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
-
-  effectIt.effect("projects inline context before sending the provider turn", () =>
-    Effect.gen(function* () {
-      const harness = yield* Effect.promise(() => createHarness());
-
-      yield* harness.engine.dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make("cmd-turn-start-with-context"),
-        threadId: ThreadId.make("thread-1"),
-        message: {
-          messageId: asMessageId("user-message-with-context"),
-          role: "user",
-          text: "Inspect [build](t3-context://v1/terminal/terminal-1)",
-          attachments: [],
-          context: {
-            version: 1,
-            records: [
-              {
-                version: 1,
-                kind: "terminal",
-                contextId: ComposerContextId.make("terminal-1"),
-                label: "build",
-                terminalId: "terminal-1",
-                terminalLabel: "Build",
-                lineStart: 7,
-                lineEnd: 7,
-                text: "compiled successfully",
-              },
-            ],
-          },
-        },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      });
-
-      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
-      expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
-        input: expect.stringContaining("[Terminal: build; ref=terminal-1]"),
-      });
-      expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
-        input: expect.stringContaining('<context kind="terminal" id="terminal-1">'),
-      });
-    }),
-  );
 
   effectIt.effect("retains a turn dispatched immediately after start until activation", () =>
     Effect.gen(function* () {
@@ -1586,139 +1789,10 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
-  effectIt.effect.each(["before completion", "after completion", "before startup"] as const)(
-    "refines a vague title once when initial generation finishes %s",
-    (timing) =>
-      Effect.gen(function* () {
-        const harness = yield* Effect.promise(() =>
-          createHarness({ deferReactorStart: timing === "before startup" }),
-        );
-        const threadId = ThreadId.make("thread-1");
-        const turnId = TurnId.make("title-first-turn");
-        const createdAt = "2026-01-01T00:00:01.000Z";
-        harness.generateThreadTitle.mockReturnValue(
-          Effect.succeed({ title: "Fix QR pairing expiry" }),
-        );
-        yield* harness.engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("title-turn"),
-          threadId,
-          message: {
-            messageId: MessageId.make("title-user"),
-            role: "user",
-            text: "Fix this",
-            attachments: [],
-          },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
-          createdAt,
-        });
-        yield* Effect.promise(() => harness.drain());
-        const generate = harness.engine.dispatch({
-          type: "thread.title.generate.complete",
-          commandId: CommandId.make("initial-title"),
-          threadId,
-          expectedTitle: "Thread",
-          expectedVersion: null,
-          title: "Investigate issue",
-          needsRefinement: true,
-        });
-        if (timing !== "after completion") yield* generate;
-        yield* harness.engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make("title-running"),
-          threadId,
-          createdAt,
-          session: {
-            threadId,
-            status: "running",
-            providerName: "codex",
-            runtimeMode: "approval-required",
-            activeTurnId: turnId,
-            lastError: null,
-            updatedAt: createdAt,
-          },
-        });
-        yield* harness.engine.dispatch({
-          type: "thread.message.assistant.delta",
-          commandId: CommandId.make("title-answer"),
-          threadId,
-          messageId: MessageId.make("title-assistant"),
-          turnId,
-          delta: "The QR pairing token expires before the phone redeems it.",
-          createdAt,
-        });
-        const ready = (commandId: string) =>
-          harness.engine.dispatch({
-            type: "thread.session.set",
-            commandId: CommandId.make(commandId),
-            threadId,
-            createdAt,
-            session: {
-              threadId,
-              status: "ready",
-              providerName: "codex",
-              runtimeMode: "approval-required",
-              activeTurnId: null,
-              lastError: null,
-              updatedAt: createdAt,
-            },
-          });
-        yield* ready("title-ready");
-        if (timing === "after completion") yield* generate;
-        if (timing === "before startup") {
-          yield* Effect.promise(harness.startReactor);
-        }
-        yield* Effect.promise(() => harness.drain());
-        if (timing === "before startup") {
-          expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
-        }
-        yield* ready("title-ready-again");
-        yield* Effect.promise(() => harness.drain());
-        expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
-        expect(harness.generateThreadTitle.mock.calls[0]?.[0].message).toContain(
-          "QR pairing token",
-        );
-        const thread = (yield* Effect.promise(() => harness.readModel())).threads[0];
-        expect(thread?.title).toBe("Fix QR pairing expiry");
-        expect(thread?.titleState?.needsRefinement).toBe(false);
-      }),
-  );
-
-  effectIt.effect("does not replace a manual title matching the first message seed", () =>
-    Effect.gen(function* () {
-      const harness = yield* Effect.promise(() => createHarness());
-      const threadId = ThreadId.make("thread-1");
-      yield* harness.engine.dispatch({
-        type: "thread.meta.update",
-        commandId: CommandId.make("manual-title"),
-        threadId,
-        title: "Thread",
-      });
-      yield* harness.engine.dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make("manual-title-turn"),
-        threadId,
-        titleSeed: "Thread",
-        message: {
-          messageId: MessageId.make("manual-title-user"),
-          role: "user",
-          text: "Fix this",
-          attachments: [],
-        },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        createdAt: "2026-01-01T00:00:01.000Z",
-      });
-      yield* Effect.promise(() => harness.drain());
-      expect(harness.generateThreadTitle).not.toHaveBeenCalled();
-    }),
-  );
-
   it("retries thread title generation after a transient failure", async () => {
+    const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const seededTitle = "Please investigate reconnect failures after restar...";
-    const harness = await createHarness({ initialTitle: seededTitle });
     let attempts = 0;
     harness.generateThreadTitle.mockReturnValue(
       Effect.suspend(() => {
@@ -1731,6 +1805,15 @@ describe("ProviderCommandReactor", () => {
               }),
             )
           : Effect.succeed({ title: "Generated title" });
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
       }),
     );
 
@@ -1961,17 +2044,14 @@ describe("ProviderCommandReactor", () => {
       throw new Error("Expected a title generation input");
     }
     const message = input.message;
-    expect(message).toContain(
-      `USER:\nReview subagent monitoring risks. ${quoteText.slice(0, 100)}`,
-    );
+    expect(message.startsWith(`USER:\nReview subagent monitoring risks. ${quoteText} `)).toBe(true);
     expect(message).not.toContain("t3-citation://");
-    expect(message).toContain("[Content truncated]");
+    expect(message).toContain("[First user message truncated]");
     expect(message).toContain("[Earlier content truncated]");
     expect(message).toContain("image.png");
-    expect(message.length).toBeLessThanOrEqual(8_000);
+    expect(message).toHaveLength(8_000);
     expect(input.attachments?.map((attachment) => attachment.id)).toEqual([
       "opening-context-image",
-      "middle-context-image",
       "recent-context-image",
     ]);
     const readModel = await harness.readModel();
@@ -2175,6 +2255,10 @@ describe("ProviderCommandReactor", () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const firstUserContext = "USER:\nOld visual issue\n[Attachments: old-issue.png]";
+    const truncationMarker = "[Earlier content truncated]\n\n";
+    const retainedContext = "x".repeat(
+      8_000 - firstUserContext.length - "\n\n".length - truncationMarker.length,
+    );
 
     await harness.runEffect(
       harness.engine.dispatch({
@@ -2238,10 +2322,9 @@ describe("ProviderCommandReactor", () => {
 
     await harness.drain();
 
-    const context = harness.generateThreadTitle.mock.calls[0]?.[0].message;
-    expect(context).toContain(firstUserContext);
-    expect(context).toContain("ASSISTANT:\ncontent before retained tail");
-    expect(context?.length).toBeLessThanOrEqual(8_000);
+    expect(harness.generateThreadTitle.mock.calls[0]?.[0].message).toBe(
+      `${firstUserContext}\n\n${truncationMarker}${retainedContext}`,
+    );
     expect(harness.generateThreadTitle.mock.calls[0]?.[0].attachments).toEqual([
       expect.objectContaining({
         id: "old-title-context-image",
@@ -2479,13 +2562,22 @@ describe("ProviderCommandReactor", () => {
   });
 
   it("matches the client-seeded title even when the outgoing prompt is reformatted", async () => {
+    const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const seededTitle = "Fix reconnect spinner on resume";
-    const harness = await createHarness({ initialTitle: seededTitle });
     const prompt = `[effort:high]\\n\\nFix reconnect spinner on resume ${serializeAssistantCitation(assistantCitation)}`;
     harness.generateThreadTitle.mockReturnValue(
       Effect.succeed({
         title: "Reconnect spinner resume bug",
+      }),
+    );
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-formatted-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
       }),
     );
 

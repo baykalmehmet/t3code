@@ -4,7 +4,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
-import { EventId } from "@t3tools/contracts";
+import { EventId, MessageId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type {
   OrchestrationThreadActivity,
@@ -26,6 +26,11 @@ export function isOwwWorkspace(workspace: string): boolean {
     /* Missing worktrees fail closed. */
   }
   return path === projectRoot || path.startsWith(projectRoot + NodePath.sep);
+}
+
+/** Stable projected message identity for one workflow's authoritative status. */
+export function workflowStatusMessageId(runId: string): MessageId {
+  return MessageId.make(`oww-workflow-status:${runId}`);
 }
 
 export type WorkflowOperation =

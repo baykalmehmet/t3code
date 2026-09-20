@@ -68,6 +68,7 @@ import {
   stageActivityToNative,
   submitOwwRequest,
   monitorOwwWorkflow,
+  workflowStatusMessageId,
   workflowStageActivity,
   type ApprovalActivity,
   type WorkflowTelemetry,
@@ -1357,16 +1358,17 @@ const make = Effect.gen(function* () {
     // Dispatch before provider auth/session/worktree setup. Failures never fall through.
     const workflowProject = yield* resolveProject(thread.projectId);
     const workflowTurnId = TurnId.make(`oww-workflow:${event.payload.messageId}`);
-    const workflowMessage = Effect.fn("workflowMessage")(function* (text: string) {
-      const messageId = MessageId.make(
-        `oww-workflow:${event.payload.messageId}:${yield* serverEventId()}`,
-      );
+    const workflowMessage = Effect.fn("workflowMessage")(function* (text: string, runId?: string) {
+      const messageId = runId
+        ? workflowStatusMessageId(runId)
+        : MessageId.make(`oww-workflow:${event.payload.messageId}:${yield* serverEventId()}`);
       yield* orchestrationEngine.dispatch({
         type: "thread.message.assistant.delta",
         commandId: yield* serverCommandId("oww-workflow-message"),
         threadId: thread.id,
         messageId,
         delta: text,
+        ...(runId ? { replace: true } : {}),
         turnId: workflowTurnId,
         createdAt: event.payload.createdAt,
       });
@@ -1460,7 +1462,10 @@ const make = Effect.gen(function* () {
           if (!submission.handled) return false;
           const id = submission.workflow.run_id;
           // Persist a safe operational snapshot before any stage runs, including on a retry.
-          yield* workflowMessage(formatWorkflowStatus(submission.workflow));
+          yield* workflowMessage(
+            formatWorkflowStatus(submission.workflow),
+            submission.workflow.run_id,
+          );
           if (submission.notice) yield* workflowMessage(submission.notice);
           if (submission.resume) {
             // Keep the synthetic workflow turn live while its detached monitor emits
@@ -1470,7 +1475,8 @@ const make = Effect.gen(function* () {
             yield* Effect.tryPromise(() =>
               monitorOwwWorkflow(
                 id,
-                (value) => Effect.runPromise(workflowMessage(formatWorkflowStatus(value))),
+                (value) =>
+                  Effect.runPromise(workflowMessage(formatWorkflowStatus(value), value.run_id)),
                 undefined,
                 (activity) => Effect.runPromise(workflowTelemetry(activity)),
               ),
@@ -1478,6 +1484,7 @@ const make = Effect.gen(function* () {
               Effect.catch((error) =>
                 workflowMessage(
                   `Workflow ${id}: monitoring failed. Use Show workflow status for this ID. ${String(error)}`,
+                  id,
                 ),
               ),
               Effect.ensuring(stopWorkflowSession().pipe(Effect.ignoreCause({ log: true }))),
@@ -1887,13 +1894,14 @@ const make = Effect.gen(function* () {
         });
       });
       const appendWorkflowMessage = Effect.fn("appendOwwActionMessage")(function* (text: string) {
-        const messageId = MessageId.make(`oww-workflow:${requestId}:${yield* serverEventId()}`);
+        const messageId = workflowStatusMessageId(owwApproval.runId);
         yield* orchestrationEngine.dispatch({
           type: "thread.message.assistant.delta",
           commandId: yield* serverCommandId("oww-workflow-action-message"),
           threadId: event.payload.threadId,
           messageId,
           delta: text,
+          replace: true,
           turnId: workflowTurnId,
           createdAt: event.payload.createdAt,
         });

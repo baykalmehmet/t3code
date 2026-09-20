@@ -4,6 +4,7 @@ import {
   monitorOwwWorkflow,
   resolveOwwApprovalAction,
   submitOwwRequest,
+  workflowStatusMessageId,
   type WorkflowCall,
   type WorkflowRecord,
 } from "./owwWorkflow.ts";
@@ -24,6 +25,11 @@ const request = {
 };
 
 describe("OWW Hatchet dispatch", () => {
+  it("uses one stable message identity for every authoritative status update", () => {
+    expect(workflowStatusMessageId(runId)).toBe(workflowStatusMessageId(runId));
+    expect(String(workflowStatusMessageId(runId))).toBe(`oww-workflow-status:${runId}`);
+    expect(workflowStatusMessageId(runId)).not.toBe(workflowStatusMessageId(`${runId}0`));
+  });
   it("starts a typed Hatchet run without model selection from chat", async () => {
     const call = vi.fn<WorkflowCall>().mockResolvedValue(base);
     const result = await submitOwwRequest(request, call);
@@ -440,7 +446,8 @@ describe("OWW native approval actions", () => {
     };
     const call = vi.fn<WorkflowCall>().mockImplementation(async (name) => {
       if (name === "get_run_details") return attention;
-      if (name === "recover_executor") return { ...attention, run_id: "87654321-4321-4321-4321-cba987654321", status: "QUEUED" };
+      if (name === "recover_executor")
+        return { ...attention, run_id: "87654321-4321-4321-4321-cba987654321", status: "QUEUED" };
       return attention;
     });
     const result = await submitOwwRequest(
